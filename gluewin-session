@@ -1,0 +1,18 @@
+#!/bin/sh
+# Starts X when launched from a TUI greeter, then session bus, audio and the WM.
+if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${GLUEWIN_XSTARTED:-}" ]; then
+    GLUEWIN_XSTARTED=1; export GLUEWIN_XSTARTED
+    exec startx "$0" -- "vt${XDG_VTNR:-1}"
+fi
+export GLUE_SESSION=gluewin
+export XDG_CURRENT_DESKTOP=gluewin
+export XDG_SESSION_DESKTOP=gluewin
+export XDG_SESSION_TYPE=x11
+export XCURSOR_THEME="${XCURSOR_THEME:-Adwaita}"
+export XCURSOR_SIZE="${XCURSOR_SIZE:-24}"
+exec dbus-run-session sh -lc '
+  command -v pipewire       >/dev/null 2>&1 && pipewire &
+  command -v wireplumber    >/dev/null 2>&1 && wireplumber &
+  command -v pipewire-pulse >/dev/null 2>&1 && pipewire-pulse &
+  exec gluewin
+'

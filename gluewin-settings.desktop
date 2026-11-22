@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Settings
+Name[ro]=Setări
+Comment=Display, sound, network, Bluetooth, personalization, apps and updates
+Comment[ro]=Ecran, sunet, rețea, Bluetooth, personalizare, aplicații și actualizări
+Exec=gluewin-settings
+Icon=preferences-system
+Categories=Settings;System;
+OnlyShowIn=gluewin;

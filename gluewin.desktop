@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Gluewin
+Comment=Light desktop that looks and works like Windows 11
+Exec=/usr/bin/gluewin-session
+TryExec=/usr/bin/gluewin
+Type=XSession
+DesktopNames=gluewin
