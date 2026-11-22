@@ -1,17 +1,20 @@
 /* gluewin-settings: Windows 11 style settings, plain Xlib/Xft */
 #include "common.h"
 #include <sys/utsname.h>
+#include <setjmp.h>
+#include <jpeglib.h>
+#include <webp/decode.h>
 
 enum { NAVW = 290, PAD = 28, RH = 68, CWMAX = 920, HEAD = 86 };
-enum { P_SYS, P_BT, P_NET, P_PERS, P_APPS, P_UPD, NPAGE };
-enum { A_NAV = 1, A_TOGGLE, A_DROP, A_SLIDER, A_BTN, A_WIFI, A_BTDEV, A_SWATCH, A_WALL, A_UNINST };
+enum { P_SYS, P_BT, P_NET, P_PERS, P_APPS, P_LANG, P_UPD, NPAGE };
+enum { A_NAV = 1, A_TOGGLE, A_DROP, A_SLIDER, A_BTN, A_WIFI, A_BTDEV, A_SWATCH, A_WALL, A_UNINST, A_KBDEL, A_KBUP };
 enum { T_BT, T_WIFI, T_TILING };
-enum { D_MODE, D_ALIGN, D_BAR, D_RES = 10 };
+enum { D_MODE, D_ALIGN, D_BAR, D_KBADD, D_LANG, D_RES = 10 };
 enum { S_BRIGHT, S_VOL };
 enum { B_DISPADV, B_SOUNDADV, B_BTADD, B_NETADV, B_BROWSE, B_UPDATE, B_PWOK, B_PWCANCEL, B_RESCAN };
 
-static const int pg_glyph[NPAGE] = {G_SYSTEM, G_BT, G_WIFI, G_BRUSH, G_APPS, G_UPDATE};
-static const char *pg_id[NPAGE] = {"system", "bluetooth", "network", "personalization", "apps", "update"};
+static const int pg_glyph[NPAGE] = {G_SYSTEM, G_BT, G_WIFI, G_BRUSH, G_APPS, G_KEYBOARD, G_UPDATE};
+static const char *pg_id[NPAGE] = {"system", "bluetooth", "network", "personalization", "apps", "language", "update"};
 static const unsigned accents[] = {0x0067C0, 0x0078D4, 0x0099BC, 0x2D7D9A, 0x00B294, 0x10893E,
 	0x498205, 0xCA5010, 0xE81123, 0xC30052, 0x8764B8, 0x744DA9, 0x5D5A58, 0x767676};
 
@@ -23,6 +26,7 @@ static const char *pg_name(int p)
 	case P_NET: return T("Network & internet", "Rețea și internet");
 	case P_PERS: return T("Personalization", "Personalizare");
 	case P_APPS: return T("Apps", "Aplicații");
+	case P_LANG: return T("Time & language", "Oră și limbă");
 	default: return T("Update", "Actualizări");
 	}
 }
@@ -54,6 +58,9 @@ static int pw_on;
 
 static char walls[10][256], last_upd[64];
 static int nwalls;
+static Picture thumb[10];
+static char thumb_tried[10];
+enum { TBW = 160, TBH = 90 };
 
 static int drop = -1, drop_x, drop_y, drop_w, drop_n, drop_sel, drop_hover = -1;
 static char drop_opt[24][48];
@@ -231,9 +238,102 @@ static void scan_walls(const char *dir, int depth)
 	closedir(d);
 }
 
+struct jerr { struct jpeg_error_mgr m; jmp_buf jb; };
+static void jpeg_fail(j_common_ptr c) { longjmp(((struct jerr *)c->err)->jb, 1); }
+
+/* decodes to 0xAARRGGBB; jpeg is decoded at 1/2..1/8 scale to stay cheap */
+static unsigned *decode(const char *path, int *w, int *h)
+{
+	const char *x = strrchr(path, '.');
+	unsigned *px = NULL;
+	if (!x) return NULL;
+	if (!strcasecmp(x, ".png")) {
+		png_image im;
+		memset(&im, 0, sizeof im);
+		im.version = PNG_IMAGE_VERSION;
+		if (!png_image_begin_read_from_file(&im, path)) return NULL;
+		im.format = PNG_FORMAT_BGRA;
+		if (im.width > 8192 || im.height > 8192 || !(px = malloc(PNG_IMAGE_SIZE(im)))) { png_image_free(&im); return NULL; }
+		if (!png_image_finish_read(&im, NULL, px, 0, NULL)) { free(px); return NULL; }
+		*w = (int)im.width; *h = (int)im.height;
+	} else if (!strcasecmp(x, ".webp")) {
+		FILE *f = fopen(path, "rb");
+		long n;
+		unsigned char *d;
+		if (!f) return NULL;
+		fseek(f, 0, SEEK_END);
+		n = ftell(f);
+		rewind(f);
+		if (n > 0 && n < (64 << 20) && (d = malloc((size_t)n))) {
+			if (fread(d, 1, (size_t)n, f) == (size_t)n) px = (unsigned *)WebPDecodeBGRA(d, (size_t)n, w, h);
+			free(d);
+		}
+		fclose(f);
+	} else {
+		struct jpeg_decompress_struct c;
+		struct jerr e;
+		FILE *f = fopen(path, "rb");
+		if (!f) return NULL;
+		c.err = jpeg_std_error(&e.m);
+		e.m.error_exit = jpeg_fail;
+		if (setjmp(e.jb)) { jpeg_destroy_decompress(&c); fclose(f); free(px); return NULL; }
+		jpeg_create_decompress(&c);
+		jpeg_stdio_src(&c, f);
+		jpeg_read_header(&c, TRUE);
+		c.out_color_space = JCS_EXT_BGRX;
+		c.scale_num = 1;
+		for (c.scale_denom = 8; c.scale_denom > 1 && (c.image_width / c.scale_denom < TBW * 2 || c.image_height / c.scale_denom < TBH * 2); c.scale_denom /= 2);
+		jpeg_start_decompress(&c);
+		*w = (int)c.output_width; *h = (int)c.output_height;
+		px = malloc((size_t)*w * (size_t)*h * 4);
+		while (c.output_scanline < c.output_height) {
+			JSAMPROW r = (JSAMPROW)(px + (size_t)c.output_scanline * (size_t)*w);
+			jpeg_read_scanlines(&c, &r, 1);
+		}
+		jpeg_finish_decompress(&c);
+		jpeg_destroy_decompress(&c);
+		fclose(f);
+	}
+	return px;
+}
+
+/* box-filtered, center-cropped to 16:9 like Windows' picture tiles */
+static Picture make_thumb(const char *path)
+{
+	int w, h, cx, cy, cw, ch;
+	unsigned *src = decode(path, &w, &h), *dst;
+	if (!src) return 0;
+	cw = w; ch = w * TBH / TBW;
+	if (ch > h) { ch = h; cw = h * TBW / TBH; }
+	cx = (w - cw) / 2; cy = (h - ch) / 2;
+	dst = malloc(TBW * TBH * 4);
+	for (int y = 0; y < TBH; y++)
+		for (int x = 0; x < TBW; x++) {
+			int x0 = cx + x * cw / TBW, x1 = MAX(x0 + 1, cx + (x + 1) * cw / TBW);
+			int y0 = cy + y * ch / TBH, y1 = MAX(y0 + 1, cy + (y + 1) * ch / TBH);
+			unsigned r = 0, g = 0, b = 0, n = 0;
+			for (int yy = y0; yy < y1; yy++)
+				for (int xx = x0; xx < x1; xx++) {
+					unsigned p = src[(size_t)yy * (size_t)w + (size_t)xx];
+					r += (p >> 16) & 255; g += (p >> 8) & 255; b += p & 255; n++;
+				}
+			dst[y * TBW + x] = 0xFF000000u | (r / n) << 16 | (g / n) << 8 | (b / n);
+		}
+	if (strcasecmp(strrchr(path, '.'), ".webp")) free(src);
+	else WebPFree(src);
+	Pixmap pm = XCreatePixmap(dpy, root, TBW, TBH, depth);
+	XImage *im = XCreateImage(dpy, vis, depth, ZPixmap, 0, (char *)dst, TBW, TBH, 32, 0);
+	XPutImage(dpy, pm, DefaultGC(dpy, scr), im, 0, 0, 0, 0, TBW, TBH);
+	XDestroyImage(im);
+	Picture p = XRenderCreatePicture(dpy, pm, fmt, 0, NULL);
+	XFreePixmap(dpy, pm);
+	return p;
+}
+
 static void load_pers(void)
 {
 	char p[512];
+	for (int i = 0; i < (int)LEN(thumb); i++) { if (thumb[i]) XRenderFreePicture(dpy, thumb[i]); thumb[i] = 0; thumb_tried[i] = 0; }
 	nwalls = 0;
 	scan_walls("/usr/share/backgrounds", 2);
 	snprintf(p, sizeof p, "%s/Pictures/Wallpapers", home());
@@ -254,6 +354,8 @@ static void load_upd(void)
 	fclose(f);
 }
 
+static void load_lang(void);
+
 static void load_page(void)
 {
 	switch (page) {
@@ -263,6 +365,7 @@ static void load_page(void)
 	case P_PERS: load_pers(); break;
 	case P_APPS: if (!napps) apps_load(); break;
 	case P_UPD: load_upd(); break;
+	case P_LANG: load_lang(); break;
 	}
 }
 
@@ -514,16 +617,20 @@ static int pg_pers(int x, int y, int w)
 	row(x, y, w, G_FOLDER, T("Choose a photo", "Alege o fotografie"), cfg.wallpaper[0] ? basename_of(cfg.wallpaper) : NULL);
 	if (have("zenity") || have("kdialog")) rbutton(x + w, y, T("Browse photos", "Răsfoiește"), 0, A_BTN, B_BROWSE);
 	y += RH + 4;
+	if (!nwalls) return y;
+	int tp = MAX(1, (w - 40 + 12) / (TBW + 12)), rows = (nwalls + tp - 1) / tp;
+	card(x, y, w, rows * (TBH + 12) + 28);
+	text(F_sm, x + 20, y + 10, T("Recent images", "Imagini recente"), th.sub);
 	for (int i = 0; i < nwalls; i++) {
-		int on = !strcmp(walls[i], cfg.wallpaper), ry = y;
-		card(x, y, w, 44);
-		if (hov(x, y, w, 44)) rbox(x, y, w, 44, 6, th.hover, th.border);
-		if (on) glyph(G_CHECK, x + 22, y + 11, 20, th.accent);
-		textfit(F_ui, x + 62, y + (44 - fh(F_ui)) / 2, w - 80, basename_of(walls[i]), on ? th.accent : th.text);
-		addhot(x, ry, w, 44, A_WALL, i);
-		y += 46;
+		int tx = x + 20 + (i % tp) * (TBW + 12), ty = y + 32 + (i / tp) * (TBH + 12);
+		if (!thumb_tried[i] && ty < wh && ty + TBH > 0) { thumb_tried[i] = 1; thumb[i] = make_thumb(walls[i]); }
+		if (!strcmp(walls[i], cfg.wallpaper)) rrect(tx - 3, ty - 3, TBW + 6, TBH + 6, 6, th.accent, 255);
+		else if (hov(tx, ty, TBW, TBH)) rrect(tx - 2, ty - 2, TBW + 4, TBH + 4, 5, th.sub, 255);
+		if (thumb[i]) XRenderComposite(dpy, PictOpSrc, thumb[i], None, B.pic, 0, 0, 0, 0, tx, ty, TBW, TBH);
+		else { rrect(tx, ty, TBW, TBH, 4, th.hover, 255); textfit(F_sm, tx + 8, ty + TBH / 2 - 7, TBW - 16, basename_of(walls[i]), th.sub); }
+		addhot(tx, ty, TBW, TBH, A_WALL, i);
 	}
-	return y;
+	return y + rows * (TBH + 12) + 28;
 }
 
 static int pg_apps(int x, int y, int w)
@@ -541,6 +648,66 @@ static int pg_apps(int x, int y, int w)
 			button(x + w - tw(F_ui, l) - 52, y + 12, l, 0, A_UNINST, i);
 		}
 		y += 60;
+	}
+	return y;
+}
+
+static char kb[8][16], kbadd[24][16];
+static int nkb, nkbadd, lang_changed;
+
+static void apply_cfg(int dark_changed);
+
+static void load_lang(void)
+{
+	nkb = cfg.keyboard[0] ? kbd_split(cfg.keyboard, kb, (int)LEN(kb)) : kbd_current(kb, (int)LEN(kb));
+	if (!nkb) { strcpy(kb[0], "us"); nkb = 1; }
+}
+
+static void kb_save(void)
+{
+	cfg.keyboard[0] = 0;
+	for (int i = 0; i < nkb; i++) {
+		size_t l = strlen(cfg.keyboard);
+		snprintf(cfg.keyboard + l, sizeof cfg.keyboard - l, "%s%s", i ? "," : "", kb[i]);
+	}
+	apply_cfg(0);
+}
+
+static int pg_lang(int x, int y, int w)
+{
+	char s[160];
+	time_t now = time(NULL);
+	section(x, &y, T("Date & time", "Data și ora"));
+	strftime(s, sizeof s, "%H:%M   %d.%m.%Y", localtime(&now));
+	row(x, y, w, G_INFO, T("Current date and time", "Data și ora curente"), getenv("TZ") ? getenv("TZ") : NULL);
+	valtext(x + w, y, s);
+	y += RH + 4;
+	section(x, &y, T("Language", "Limbă"));
+	row(x, y, w, G_GLOBE, T("Display language", "Limba de afișare"),
+		lang_changed ? T("Sign out to apply it to all apps", "Deconectează-te ca să se aplice în toate aplicațiile")
+		: T("Menus, Settings and apps use this language", "Meniurile, Setările și aplicațiile folosesc această limbă"));
+	dropbtn(x + w, y, MIN(200, w / 2 - 20), RO ? "Română" : "English", D_LANG);
+	y += RH + 4;
+	section(x, &y, T("Keyboard", "Tastatură"));
+	for (int i = 0; i < nkb; i++) {
+		const Kbd *k = kbd_info(kb[i]);
+		snprintf(s, sizeof s, "%s  ·  %s", kb[i], i ? T("Switch with Win+Space", "Comuți cu Win+Space") : T("Default", "Implicită"));
+		row(x, y, w, G_KEYBOARD, k ? T(k->en, k->ro) : kb[i], s);
+		int bx = x + w - 20;
+		if (nkb > 1) { const char *l = T("Remove", "Elimină"); bx -= tw(F_ui, l) + 32; button(bx, y + (RH - 32) / 2, l, 0, A_KBDEL, i); }
+		if (i) { const char *l = T("Make default", "Fă implicită"); bx -= tw(F_ui, l) + 32 + 8; button(bx, y + (RH - 32) / 2, l, 0, A_KBUP, i); }
+		y += RH + 4;
+	}
+	nkbadd = 0;
+	for (int i = 0; i < (int)LEN(kbds) && nkbadd < (int)LEN(kbadd); i++) {
+		int have_it = 0;
+		for (int j = 0; j < nkb; j++) have_it |= !strcmp(kb[j], kbds[i].code);
+		if (!have_it) strcpy(kbadd[nkbadd++], kbds[i].code);
+	}
+	if (nkb < (int)LEN(kb) && nkbadd) {
+		row(x, y, w, G_PLUS, T("Add a keyboard", "Adaugă o tastatură"), T("Windows key + Space switches between keyboards", "Tasta Windows + Space comută între tastaturi"));
+		dropbtn(x + w, y, MIN(240, w / 2 - 20), T("Choose…", "Alege…"), D_KBADD);
+		y += RH + 4;
 	}
 	return y;
 }
@@ -596,6 +763,7 @@ static void draw(void)
 	case P_NET: y = pg_net(cx, y, cw); break;
 	case P_PERS: y = pg_pers(cx, y, cw); break;
 	case P_APPS: y = pg_apps(cx, y, cw); break;
+	case P_LANG: y = pg_lang(cx, y, cw); break;
 	case P_UPD: y = pg_upd(cx, y, cw); break;
 	}
 	content_h = y + scroll - HEAD + PAD;
@@ -662,6 +830,16 @@ static void open_drop(int id, int x, int y, int w)
 		strcpy(drop_opt[drop_n++], T("Bottom", "Jos"));
 		strcpy(drop_opt[drop_n++], T("Top", "Sus"));
 		drop_sel = cfg.bar_top;
+	} else if (id == D_LANG) {
+		strcpy(drop_opt[drop_n++], "English");
+		strcpy(drop_opt[drop_n++], "Română");
+		drop_sel = RO;
+	} else if (id == D_KBADD) {
+		for (int i = 0; i < nkbadd && drop_n < (int)LEN(drop_opt); i++) {
+			const Kbd *k = kbd_info(kbadd[i]);
+			snprintf(drop_opt[drop_n++], sizeof drop_opt[0], "%s", T(k->en, k->ro));
+		}
+		drop_sel = -1;
 	} else if (id >= D_RES) {
 		Out *o = &outs[id - D_RES];
 		for (int i = 0; i < o->nm && drop_n < 14; i++) strcpy(drop_opt[drop_n++], o->modes[i]);
@@ -680,6 +858,8 @@ static void pick_drop(int i)
 	if (id == D_MODE && cfg.dark != i) { cfg.dark = i; apply_cfg(1); }
 	else if (id == D_ALIGN && cfg.align_left != i) { cfg.align_left = i; apply_cfg(0); }
 	else if (id == D_BAR && cfg.bar_top != i) { cfg.bar_top = i; apply_cfg(0); }
+	else if (id == D_LANG && RO != i) { RO = i; lang_changed = 1; apply_cfg(0); }
+	else if (id == D_KBADD && i < nkbadd && nkb < (int)LEN(kb)) { strcpy(kb[nkb++], kbadd[i]); kb_save(); }
 	else if (id >= D_RES && outs[id - D_RES].cur != i) {
 		run("xrandr", "--output", outs[id - D_RES].name, "--mode", drop_opt[i], NULL);
 		outs[id - D_RES].cur = i;
@@ -745,6 +925,10 @@ static void click(Hot *h)
 	case A_SWATCH: cfg.accent = accents[h->arg]; apply_cfg(0); break;
 	case A_WALL: snprintf(cfg.wallpaper, sizeof cfg.wallpaper, "%s", walls[h->arg]); apply_cfg(0); break;
 	case A_UNINST: term_self("--uninstall", apps[h->arg].id); break;
+	case A_KBDEL:
+		if (nkb > 1) { memmove(kb[h->arg], kb[h->arg + 1], (size_t)(nkb - h->arg - 1) * sizeof kb[0]); nkb--; kb_save(); }
+		break;
+	case A_KBUP: { char t[16]; memcpy(t, kb[h->arg], 16); memmove(kb[1], kb[0], (size_t)h->arg * sizeof kb[0]); memcpy(kb[0], t, 16); kb_save(); break; }
 	case A_BTDEV:
 		run("bluetoothctl", bts[h->arg].conn ? "disconnect" : "connect", bts[h->arg].mac, NULL);
 		later(T("Working…", "Se lucrează…"), 4000);
@@ -911,14 +1095,12 @@ static int update(void)
 
 int main(int argc, char **argv)
 {
-	const char *l = getenv("LC_ALL");
 	XSizeHints sh = {0};
 	XClassHint ch = {"gluewin-settings", "Gluewin-settings"};
 	XSetWindowAttributes swa;
 	XEvent ev;
 	setlocale(LC_ALL, "");
-	if (!l || !*l) l = getenv("LANG");
-	RO = l && !strncmp(l, "ro", 2);
+	cfg_load();
 	if (argc > 2 && !strcmp(argv[1], "--uninstall")) return uninstall(argv[2]);
 	if (argc > 1 && !strcmp(argv[1], "--update")) return update();
 	if (argc > 1 && !strcmp(argv[1], "--bt-pair")) {
@@ -932,6 +1114,7 @@ int main(int argc, char **argv)
 				if (!strcmp(argv[i + 1], pg_id[p])) page = p;
 				if (!strcmp(argv[i + 1], "display") || !strcmp(argv[i + 1], "sound")) page = P_SYS;
 				if (!strcmp(argv[i + 1], "wifi")) page = P_NET;
+				if (!strcmp(argv[i + 1], "keyboard") || !strcmp(argv[i + 1], "time")) page = P_LANG;
 			}
 	ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
 	self[n > 0 ? n : 0] = 0;

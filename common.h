@@ -26,6 +26,7 @@
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
 #include <X11/XF86keysym.h>
+#include <X11/XKBlib.h>
 #include <X11/Xft/Xft.h>
 #include <X11/extensions/Xrender.h>
 #include <X11/extensions/shape.h>
@@ -53,7 +54,7 @@ typedef struct {
 	int dark, align_left, bar_top, tiling;
 	unsigned accent;
 	char wallpaper[512], pinned[1024], start[2048];
-	char terminal[128], files[128];
+	char terminal[128], files[128], keyboard[128], language[8];
 } Cfg;
 S Cfg cfg;
 
@@ -100,6 +101,8 @@ S void cfg_read(const char *path)
 		else if (!strcmp(k, "align")) cfg.align_left = !strcmp(v, "left");
 		else if (!strcmp(k, "bar")) cfg.bar_top = !strcmp(v, "top");
 		else if (!strcmp(k, "tiling")) cfg.tiling = atoi(v) > 0;
+		else if (!strcmp(k, "language")) snprintf(cfg.language, sizeof cfg.language, "%s", v);
+		else if (!strcmp(k, "keyboard")) snprintf(cfg.keyboard, sizeof cfg.keyboard, "%s", v);
 		else if (!strcmp(k, "wallpaper")) snprintf(cfg.wallpaper, sizeof cfg.wallpaper, "%s", v);
 		else if (!strcmp(k, "pinned")) snprintf(cfg.pinned, sizeof cfg.pinned, "%s", v);
 		else if (!strcmp(k, "start")) snprintf(cfg.start, sizeof cfg.start, "%s", v);
@@ -122,6 +125,7 @@ S void cfg_load(void)
 	cfg_read("/etc/gluewin/config");
 	cfgfile(p, sizeof p);
 	cfg_read(p);
+	RO = !strcmp(cfg.language, "ro");
 	if (!cfg.terminal[0] && (t = first_have(terms))) snprintf(cfg.terminal, sizeof cfg.terminal, "%s", t);
 	if (!cfg.files[0]) {
 		if (have("glue-action")) strcpy(cfg.files, "glue-action files");
@@ -144,9 +148,9 @@ S void cfg_save(void)
 	mkdir(d, 0755);
 	snprintf(tmp, sizeof tmp, "%s.tmp", p);
 	if (!(f = fopen(tmp, "w"))) return;
-	fprintf(f, "theme=%s\naccent=#%06X\nalign=%s\nbar=%s\ntiling=%d\nwallpaper=%s\npinned=%s\nstart=%s\nterminal=%s\nfiles=%s\n",
+	fprintf(f, "theme=%s\naccent=#%06X\nalign=%s\nbar=%s\ntiling=%d\nlanguage=%s\nkeyboard=%s\nwallpaper=%s\npinned=%s\nstart=%s\nterminal=%s\nfiles=%s\n",
 		cfg.dark ? "dark" : "light", cfg.accent, cfg.align_left ? "left" : "center",
-		cfg.bar_top ? "top" : "bottom", cfg.tiling,
+		cfg.bar_top ? "top" : "bottom", cfg.tiling, RO ? "ro" : "en", cfg.keyboard,
 		cfg.wallpaper, cfg.pinned, cfg.start, cfg.terminal, cfg.files);
 	if (fclose(f) == 0) rename(tmp, p);
 }
@@ -212,10 +216,6 @@ S void gfx_init(void)
 	fmt32 = XRenderFindStandardFormat(dpy, PictStandardARGB32);
 	fmt8 = XRenderFindStandardFormat(dpy, PictStandardA8);
 	A_RELOAD = XInternAtom(dpy, "_GLUEWIN_RELOAD", False);
-	const char *l = getenv("LC_ALL");
-	if (!l || !*l) l = getenv("LC_MESSAGES");
-	if (!l || !*l) l = getenv("LANG");
-	RO = l && !strncmp(l, "ro", 2);
 }
 
 S XftFont *font(const char *size)
@@ -385,7 +385,7 @@ enum {
 	G_START, G_SEARCH, G_WIFI, G_WIFIOFF, G_ETH, G_VOL, G_MUTE, G_BATT, G_POWER, G_GEAR,
 	G_MIN, G_MAX, G_RESTORE, G_CLOSE, G_CHEVR, G_CHEVL, G_BT, G_SUN, G_LOCK, G_SIGNOUT,
 	G_RESTART, G_MOON, G_FOLDER, G_APPS, G_BRUSH, G_INFO, G_UPDATE, G_SYSTEM, G_CHECK,
-	G_CHEVD, G_PLUS, G_TASKVIEW, NGLYPH
+	G_CHEVD, G_PLUS, G_TASKVIEW, G_KEYBOARD, G_GLOBE, NGLYPH
 };
 
 S int glyph_prims(int id, Prim *p)
@@ -462,6 +462,15 @@ S int glyph_prims(int id, Prim *p)
 	case G_INFO: P(P_RING, 12, 12, 9, 1.7f, 0, 0); P(P_SEG, 12, 11, 12, 16.5f, 2); P(P_CIRC, 12, 7.6f, 1.3f); break;
 	case G_CHECK: P(P_SEG, 5, 12.5f, 10, 17.5f, 2); P(P_SEG, 10, 17.5f, 19.5f, 7, 2); break;
 	case G_PLUS: P(P_SEG, 12, 5, 12, 19, 1.8f); P(P_SEG, 5, 12, 19, 12, 1.8f); break;
+	case G_GLOBE:
+		P(P_RING, 12, 12, 8.5f, 1.6f, 0, 0); P(P_SEG, 3.5f, 12, 20.5f, 12, 1.4f);
+		P(P_SEG, 12, 3.5f, 12, 20.5f, 1.4f);
+		break;
+	case G_KEYBOARD:
+		P(P_RRO, 2.5f, 6, 19, 12, 2, 1.6f);
+		for (int i = 0; i < 4; i++) { P(P_RECT, 5.5f + i * 3.6f, 9, 1.8f, 1.8f); P(P_RECT, 7.3f + i * 3.2f, 12, 1.8f, 1.8f); }
+		P(P_SEG, 8, 15.5f, 16, 15.5f, 1.6f);
+		break;
 	case G_TASKVIEW:
 		P(P_RRO, 8.5f, 3.5f, 12, 12, 2, 1.6f);
 		P(P_SEG, 3.8f, 9.5f, 3.8f, 19.5f, 1.6f); P(P_SEG, 4.5f, 20.2f, 14.5f, 20.2f, 1.6f);
@@ -1043,6 +1052,63 @@ S void theme_export(void)
 		fprintf(f, "[Settings]\ngtk-application-prefer-dark-theme=%d\n", cfg.dark);
 		fclose(f);
 	}
+}
+
+static int kbd_split(const char *s, char out[][16], int max)
+{
+	int n = 0;
+	while (*s && n < max) {
+		size_t l = strcspn(s, ",");
+		if (l && l < 16) { memcpy(out[n], s, l); out[n][l] = 0; n++; }
+		s += l + (s[l] == ',');
+	}
+	return n;
+}
+
+/* ---------- keyboard layouts ---------- */
+
+typedef struct { const char *code, *top, *bot, *en, *ro; } Kbd;
+static const Kbd kbds[] = {
+	{"us", "ENG", "US", "English (United States)", "Engleză (Statele Unite)"},
+	{"gb", "ENG", "UK", "English (United Kingdom)", "Engleză (Regatul Unit)"},
+	{"ro", "RON", "RO", "Romanian", "Română"},
+	{"md", "RON", "MD", "Romanian (Moldova)", "Română (Moldova)"},
+	{"de", "DEU", "DE", "German", "Germană"},
+	{"fr", "FRA", "FR", "French", "Franceză"},
+	{"es", "ESP", "ES", "Spanish", "Spaniolă"},
+	{"it", "ITA", "IT", "Italian", "Italiană"},
+	{"pt", "POR", "PT", "Portuguese", "Portugheză"},
+	{"br", "POR", "BR", "Portuguese (Brazil)", "Portugheză (Brazilia)"},
+	{"hu", "HUN", "HU", "Hungarian", "Maghiară"},
+	{"pl", "POL", "PL", "Polish", "Poloneză"},
+	{"cz", "CES", "CZ", "Czech", "Cehă"},
+	{"bg", "BUL", "BG", "Bulgarian", "Bulgară"},
+	{"gr", "ELL", "GR", "Greek", "Greacă"},
+	{"tr", "TUR", "TR", "Turkish", "Turcă"},
+	{"ru", "RUS", "RU", "Russian", "Rusă"},
+	{"ua", "UKR", "UA", "Ukrainian", "Ucraineană"},
+};
+
+static const Kbd *kbd_info(const char *code)
+{
+	for (int i = 0; i < (int)LEN(kbds); i++) if (!strcmp(kbds[i].code, code)) return &kbds[i];
+	return NULL;
+}
+
+/* layouts currently loaded in the X server, from the _XKB_RULES_NAMES root property */
+static int kbd_current(char out[][16], int max)
+{
+	Atom type, a = XInternAtom(dpy, "_XKB_RULES_NAMES", False);
+	int fmt_, n = 0;
+	unsigned long len, left;
+	unsigned char *d = NULL;
+	if (XGetWindowProperty(dpy, root, a, 0, 1024, False, AnyPropertyType, &type, &fmt_, &len, &left, &d) == Success && d) {
+		const char *p = (const char *)d;
+		for (int i = 0; i < 2 && p < (const char *)d + len; i++) p += strlen(p) + 1;
+		if (p < (const char *)d + len) n = kbd_split(p, out, max);
+		XFree(d);
+	}
+	return n;
 }
 
 #endif

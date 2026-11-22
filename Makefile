@@ -9,7 +9,7 @@ gluewin: gluewin.c common.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ gluewin.c $(LDLIBS)
 
 gluewin-settings: gluewin-settings.c common.h
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ gluewin-settings.c $(LDLIBS)
+	$(CC) $(CFLAGS) $(shell pkg-config --cflags libjpeg libwebp) $(LDFLAGS) -o $@ gluewin-settings.c $(LDLIBS) $(shell pkg-config --libs libjpeg libwebp)
 
 install: all
 	install -Dm755 gluewin $(DESTDIR)$(PREFIX)/bin/gluewin

@@ -4,6 +4,13 @@ if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${GLUEWIN_XST
     GLUEWIN_XSTARTED=1; export GLUEWIN_XSTARTED
     exec startx "$0" -- "vt${XDG_VTNR:-1}"
 fi
+# display language chosen in Settings, English when unset
+case "$(sed -n 's/^language=//p' "${XDG_CONFIG_HOME:-$HOME/.config}/gluewin/config" 2>/dev/null)" in
+    ro) LANG=ro_RO.UTF-8; LANGUAGE=ro:en ;;
+    *)  LANG=en_US.UTF-8; LANGUAGE=en ;;
+esac
+unset LC_ALL LC_MESSAGES
+export LANG LANGUAGE
 export GLUE_SESSION=gluewin
 export XDG_CURRENT_DESKTOP=gluewin
 export XDG_SESSION_DESKTOP=gluewin

@@ -3,13 +3,13 @@
 A very light X11 window manager that looks and works like Windows 11, for people moving from Windows to Linux.
 Plain C on Xlib/Xft/XRender: no toolkit, no compositor. About 160 KB on disk and ~14 MB RAM.
 
-- Centered taskbar with Start, Search, Task View, pinned apps, tray, clock and Show desktop
+- Centered taskbar with Start, Search, Task View, pinned apps, tray, keyboard language, clock and Show desktop
 - Start menu with Pinned apps, All apps and search; power menu
 - Quick settings: Wi-Fi, Bluetooth, dark mode, brightness, volume, battery
 - Rounded windows with Windows-style title buttons, Snap (drag to top or sides), Alt+Tab
 - Virtual desktops through Task View, like Windows
 - Optional automatic tiling
-- `gluewin-settings`: a Windows 11 style Settings app (display, sound, battery, about, network, Bluetooth, personalization, apps, updates)
+- `gluewin-settings`: a Windows 11 style Settings app (display, sound, battery, about, network, Bluetooth, personalization with wallpaper previews, apps, time & language, updates)
 
 ## Keys
 
@@ -20,7 +20,8 @@ Plain C on Xlib/Xft/XRender: no toolkit, no compositor. About 160 KB on disk and
 | Win+1…9 | Go to desktop 1…9 |
 | Win+Shift+1…9 | Move window to desktop 1…9 |
 | Win+Ctrl+Left/Right | Previous / next desktop |
-| Win+T | Tiling on/off |
+| Win+Space | Next keyboard layout |
+| Win+T | Tiling on/off (windows go back to their old size) |
 | Win+F | Float / tile the focused window |
 | Win+Left/Right | Snap left/right (swap position when tiling) |
 | Win+Up/Down | Maximize / restore, minimize |
@@ -39,13 +40,15 @@ accent=#0067C0
 align=center         # center | left
 bar=bottom           # bottom | top
 tiling=0             # 1 = new desktops tile windows
+language=en          # en | ro, display language (sign out to apply to all apps)
+keyboard=us,ro       # keyboard layouts, first is the default
 wallpaper=/path/to/image
 pinned=files.desktop browser.desktop terminal.desktop
 ```
 
 ## Build
 
-Needs libX11, libXft, libXrender, libXext, libXrandr and libpng.
+Needs libX11, libXft, libXrender, libXext, libXrandr, libpng, libjpeg and libwebp.
 
 ```
 make
@@ -53,4 +56,4 @@ sudo make PREFIX=/usr install
 ```
 
 Pick "Gluewin" in your display manager, or run `gluewin-session`.
-Optional helpers: `xwallpaper`, `brightnessctl`, `wireplumber` or `pactl`, NetworkManager, bluez, `pavucontrol`, `arandr`.
+Keyboard layouts use `setxkbmap`. Optional helpers: `xwallpaper`, `brightnessctl`, `wireplumber` or `pactl`, NetworkManager, bluez, `pavucontrol`, `arandr`.

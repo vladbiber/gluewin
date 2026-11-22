@@ -6,7 +6,7 @@ enum { DL = 1, DR = 2, DT = 4, DB = 8 };
 typedef struct Client Client;
 struct Client {
 	Window win, frame, hdl[4];
-	int x, y, w, h, ox, oy, ow, oh, fx, fy, fw, fh;
+	int x, y, w, h, ox, oy, ow, oh, fx, fy, fw, fh, gx, gy, gw, gh, tiled;
 	int deco, dialog, minimized, max, full, snap, skiptb, noinput, takefocus, delwin;
 	int minw, minh, ignore_unmap, hover, press, shw, shh, shr, ws, floating, tord;
 	unsigned long stamp;
@@ -90,9 +90,9 @@ static int sd_n;
 static Time last_click;
 static Client *last_click_c;
 
-enum { TB_START, TB_SEARCH, TB_TASKVIEW, TB_GROUP, TB_TRAY, TB_SYS, TB_CLOCK, TB_DESK };
+enum { TB_START, TB_SEARCH, TB_TASKVIEW, TB_GROUP, TB_TRAY, TB_SYS, TB_LANG, TB_CLOCK, TB_DESK };
 enum { H_APP, H_ALL, H_BACK, H_POWER, H_SETTINGS, H_FILES, H_RUN, H_SEARCH };
-enum { CX_GROUP = 1, CX_STARTAPP, CX_POWER, CX_DESK, CX_TASKBAR, CX_WIN, CX_CAD };
+enum { CX_GROUP = 1, CX_STARTAPP, CX_POWER, CX_DESK, CX_TASKBAR, CX_WIN, CX_CAD, CX_LANG };
 enum { QS_WIFI, QS_BT, QS_DARK, QS_BRI, QS_VOL, QS_GEAR };
 
 static void restack(void);
@@ -518,6 +518,13 @@ static void arrange(void)
 {
 	Client *t[64];
 	int m, n, i, x, y, w, h, mw, sh;
+	/* windows leaving the tiling get their floating size and place back */
+	for (Client *c = clients; c; c = c->next)
+		if (c->tiled && !is_tiled(c) && !c->max && !c->full && !c->snap && !c->minimized) {
+			c->tiled = 0;
+			c->x = c->gx; c->y = c->gy; c->w = c->gw; c->h = c->gh;
+			apply(c);
+		}
 	if (!tilews[curws]) return;
 	for (m = 0; m < nmons; m++) {
 		if (!(n = tiled_on(m, t, 64))) continue;
@@ -527,6 +534,7 @@ static void arrange(void)
 		for (i = 0; i < n; i++) {
 			Client *c = t[i];
 			int nx, ny, nw, nh;
+			if (!c->tiled) { c->tiled = 1; c->gx = c->x; c->gy = c->y; c->gw = c->w; c->gh = c->h; }
 			if (!i) { nx = x; ny = y; nw = n > 1 ? mw - GAP / 2 : w; nh = h; }
 			else {
 				sh = (h - GAP * (n - 2)) / (n - 1);
@@ -896,6 +904,39 @@ static int net_glyph(void)
 
 static int tray_size(void) { return 20; }
 
+static char kbl[8][16];
+static int nkbl, xkb_event = -1;
+
+static int kbd_group(void)
+{
+	XkbStateRec s;
+	return XkbGetState(dpy, XkbUseCoreKbd, &s) == Success ? s.group : 0;
+}
+
+static void kbd_refresh(void) { nkbl = kbd_current(kbl, (int)LEN(kbl)); }
+
+/* loads the layouts from the config into the X server; empty config leaves the system default */
+static void kbd_apply(void)
+{
+	char cur[160] = "", a[160];
+	if (!cfg.keyboard[0] || strspn(cfg.keyboard, "abcdefghijklmnopqrstuvwxyz0123456789,_-") != strlen(cfg.keyboard)) return;
+	kbd_refresh();
+	for (int i = 0; i < nkbl; i++) { size_t l = strlen(cur); snprintf(cur + l, sizeof cur - l, "%s%s", i ? "," : "", kbl[i]); }
+	if (!strcmp(cur, cfg.keyboard)) return;
+	snprintf(a, sizeof a, "setxkbmap -layout %s", cfg.keyboard);
+	spawn(a);
+}
+
+static void kbd_label(int i, const char **top, const char **bot)
+{
+	static char up[16];
+	const Kbd *k = i < nkbl ? kbd_info(kbl[i]) : NULL;
+	if (k) { *top = k->top; *bot = k->bot; return; }
+	snprintf(up, sizeof up, "%s", i < nkbl ? kbl[i] : "?");
+	for (char *p = up; *p; p++) *p = (char)toupper((unsigned char)*p);
+	*top = up; *bot = "";
+}
+
 static void tb_layout(int m)
 {
 	int mw = mons[m].w, i, tot, x, rx;
@@ -920,6 +961,10 @@ static void tb_layout(int m)
 	int sw = (battery(NULL) >= 0 ? 3 : 2) * 24 + 12;
 	rx -= sw + 2;
 	tbi[ntbi++] = (TbItem){TB_SYS, rx, sw, 0};
+	if (nkbl > 1) {
+		rx -= 44 + 2;
+		tbi[ntbi++] = (TbItem){TB_LANG, rx, 44, 0};
+	}
 	if (m == 0 && ntray) {
 		int trw = ntray * (tray_size() + 8) + 4;
 		rx -= trw;
@@ -979,6 +1024,13 @@ static void tb_draw(int m)
 				int fw = (int)(12.0 * CLAMP(b, 0, 100) / 100 + .5);
 				rrect(x + 4, 22, MAX(fw, 1), 4, 1, b <= 15 && !chg ? 0xC42B1C : th.text, 255);
 			}
+			break;
+		}
+		case TB_LANG: {
+			const char *a, *b;
+			kbd_label(kbd_group(), &a, &b);
+			if (*b) { textc(F_sm, it->x, 7, it->w, a, th.text); textc(F_sm, it->x, 25, it->w, b, th.text); }
+			else textc(F_sm, it->x, (TBH - fh(F_sm)) / 2, it->w, a, th.text);
 			break;
 		}
 		case TB_TASKVIEW:
@@ -1267,6 +1319,10 @@ static void ctx_activate(int i)
 		if (id == 1) spawn("gluewin-settings --page personalization");
 		else if (id == 2) spawn("gluewin-settings --page display");
 		else if (id == 3) spawn(cfg.terminal);
+		break;
+	case CX_LANG:
+		if (id >= 10) XkbLockGroup(dpy, XkbUseCoreKbd, (unsigned)(id - 10));
+		else if (id == 1) spawn("gluewin-settings --page language");
 		break;
 	case CX_TASKBAR:
 		if (id == 1) task_manager();
@@ -2047,12 +2103,13 @@ static void super_key(KeySym ks, unsigned st)
 	if (c && is_tiled(c) && (ks == XK_Left || ks == XK_Right)) { tile_swap(c, ks == XK_Left ? -1 : 1); return; }
 	switch (ks) {
 	case XK_Tab: if (tv_on) tv_close(); else tv_open(pointer_mon()); break;
+	case XK_space: if (nkbl > 1) XkbLockGroup(dpy, XkbUseCoreKbd, (unsigned)((kbd_group() + (st & ShiftMask ? nkbl - 1 : 1)) % nkbl)); break;
 	case XK_t: { int on = !tilews[curws]; for (int i = 0; i < NWS; i++) tilews[i] = on; arrange(); tb_draw_all(); break; }
 	case XK_f:
 		if (!c) break;
 		c->floating = !c->floating;
-		if (c->floating) { int x, y, w, h; workarea(mon_of(c), &x, &y, &w, &h); c->w = w * 3 / 5; c->h = h * 2 / 3; c->x = x + (w - c->w) / 2; c->y = y + (h - c->h) / 2; apply(c); raise_client(c); }
 		arrange();
+		if (c->floating) raise_client(c);
 		break;
 	case XK_d: close_popups(); show_desktop(); break;
 	case XK_m: close_popups(); for (Client *k = clients; k; k = k->next) if (!k->skiptb && k->ws == curws) minimize(k); break;
@@ -2190,7 +2247,7 @@ static void drag_motion(int px, int py)
 	int dx = px - drag.px, dy = py - drag.py, m;
 	if (!c) return;
 	if (!drag.moved && abs(dx) < 4 && abs(dy) < 4) return;
-	if (!drag.moved && is_tiled(c)) { c->floating = 1; arrange(); }
+	if (!drag.moved && is_tiled(c)) { c->floating = 1; c->tiled = 0; arrange(); }
 	if (drag.mode == 0) {
 		if (!drag.moved && (c->max || c->snap)) {
 			/* tearing a maximized window off keeps the cursor at the same spot of the title */
@@ -2275,6 +2332,24 @@ static void tb_press(int m, XButtonEvent *e)
 	case TB_SEARCH: sm_open(3, m); break;
 	case TB_SYS: if (qs_on) qs_close(); else qs_open(); break;
 	case TB_DESK: close_popups(); show_desktop(); break;
+	case TB_LANG: {
+		int g = kbd_group();
+		char l[96];
+		close_popups();
+		nmi = 0;
+		ctx_kind = CX_LANG;
+		for (int k = 0; k < nkbl; k++) {
+			const Kbd *kb = kbd_info(kbl[k]);
+			const char *a, *b;
+			kbd_label(k, &a, &b);
+			snprintf(l, sizeof l, "%s  %s %s  %s", k == g ? "•" : "  ", a, b, kb ? T(kb->en, kb->ro) : kbl[k]);
+			ctx_add(l, 10 + k);
+		}
+		ctx_add("", -1);
+		ctx_add(T("More keyboard settings", "Mai multe setări pentru tastatură"), 1);
+		tb_ctx(it.x + mons[m].x, m);
+		break;
+	}
 	case TB_TASKVIEW: if (tv_on) tv_close(); else tv_open(m); break;
 	case TB_GROUP: {
 		Group *g = &G[it.g];
@@ -2567,6 +2642,7 @@ static void configurerequest(XConfigureRequestEvent *e)
 static void propertynotify(XPropertyEvent *e)
 {
 	Client *c = bywin(e->window);
+	if (e->window == root && e->atom == XInternAtom(dpy, "_XKB_RULES_NAMES", False)) { kbd_refresh(); update_mons(); return; }
 	if (!c || e->state == PropertyDelete) return;
 	if (e->atom == XA_WM_NAME || e->atom == A[NetWMName]) { get_title(c); draw_frame(c); if (at_on) at_draw(); }
 	else if (e->atom == A[NetWMIcon]) { get_icon(c); draw_frame(c); tb_draw_all(); }
@@ -2607,6 +2683,7 @@ static void reload(void)
 	}
 	update_mons();
 	wallpaper();
+	kbd_apply();
 	if (sm_on) sm_draw();
 	if (qs_on) qs_draw();
 }
@@ -2658,6 +2735,7 @@ static void handle(XEvent *ev)
 		if (ev->xselectionclear.window == trayselwin) tray_release();
 		return;
 	}
+	if (ev->type == xkb_event) { tb_draw_all(); return; }
 	if (ev->type == rr_event + RRScreenChangeNotify) {
 		XRRUpdateConfiguration(ev);
 		update_mons();
@@ -2757,6 +2835,11 @@ static void setup(void)
 
 	if (XRRQueryExtension(dpy, &rr_event, &rr_err)) XRRSelectInput(dpy, root, RRScreenChangeNotifyMask);
 	(void)swa;
+	int xop, xerr, xmaj = XkbMajorVersion, xmin = XkbMinorVersion;
+	if (XkbQueryExtension(dpy, &xop, &xkb_event, &xerr, &xmaj, &xmin))
+		XkbSelectEventDetails(dpy, XkbUseCoreKbd, XkbStateNotify, XkbGroupStateMask, XkbGroupStateMask);
+	kbd_refresh();
+	kbd_apply();
 	update_mons();
 	tray_setup();
 	grab_keys();
