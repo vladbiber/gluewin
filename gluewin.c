@@ -13,7 +13,9 @@ struct Client {
 	unsigned long stamp;
 	char title[256], cls[96], inst[96];
 	Icon ic;
-	int hasicon;
+	int hasicon, tw, tht;
+	Pixmap thumb;
+	Picture tpic;
 	App *app;
 	Client *next;
 };
@@ -63,6 +65,10 @@ static Group G[64];
 static int ng;
 static TbItem tbi[96];
 static int ntbi, tb_hmon = -1, tb_hover = -1;
+static Window tpwin;
+static Client *tp_c[12];
+static int tp_on, tp_n, tp_m, tp_cx, tp_g = -1, tp_w, tp_h, tp_hover = -1, tp_xhov;
+static long long tp_due, tp_cdue;
 
 static struct { int on, mode, dir, px, py, ox, oy, ow, oh, moved, zone, tiled; Client *c; } drag;
 static Window snapwin;
@@ -121,6 +127,11 @@ static void sm_draw(void);
 static void apply(Client *c);
 static void arrange(void);
 static void ws_view(int n);
+static void thumb_take(Client *c);
+static void thumb_free(Client *c);
+static void tp_drop(Client *c);
+static void tp_close(void);
+static void tp_bar_hover(int m, int h);
 static void ws_move(Client *c, int n);
 static void nc_close(void);
 static void pj_close(void);
@@ -596,6 +607,7 @@ static void z_remove(Client *c)
 
 static void raise_client(Client *c)
 {
+	if (sel && sel != c) thumb_take(sel);
 	z_remove(c);
 	if (nz < (int)LEN(zorder)) zorder[nz++] = c;
 	restack();
@@ -608,6 +620,7 @@ static void restack(void)
 	for (i = 0; i < 3; i++) if (toast_id[i]) w[n++] = toastwin[i];
 	if (osd_until) w[n++] = osdwin;
 	if (pj_on) w[n++] = pjwin;
+	if (tp_on) w[n++] = tpwin;
 	if (nc_on) { w[n++] = ncwin; w[n++] = calwin; }
 	if (sm_on) w[n++] = smwin;
 	if (ctx_on) w[n++] = ctxwin;
@@ -682,6 +695,7 @@ static void focus_top(void)
 static void minimize(Client *c)
 {
 	if (c->minimized) return;
+	thumb_take(c);
 	c->minimized = 1;
 	XUnmapWindow(dpy, c->frame);
 	for (int i = 0; i < 4; i++) XUnmapWindow(dpy, c->hdl[i]);
@@ -829,6 +843,8 @@ static void unmanage(Client *c, int destroyed)
 	XDestroyWindow(dpy, c->frame);
 	for (int i = 0; i < 4; i++) XDestroyWindow(dpy, c->hdl[i]);
 	icon_free(&c->ic);
+	thumb_free(c);
+	tp_drop(c);
 	if (sel == c) { sel = NULL; free(c); focus_top(); }
 	else free(c);
 	if (last_click_c == c) last_click_c = NULL;
@@ -2623,11 +2639,158 @@ static void rr_reconcile(void)
 
 /* --- timers --- */
 
+/* --- taskbar window previews --- */
+
+#define TPW 200
+#define TPH 120
+#define TPCW (TPW + 16)
+#define TPCH (TPH + 40)
+
+static void thumb_free(Client *c)
+{
+	if (!c->thumb) return;
+	XRenderFreePicture(dpy, c->tpic);
+	XFreePixmap(dpy, c->thumb);
+	c->thumb = 0;
+}
+
+/* no compositor: copies what is on screen, so skip while our preview covers windows */
+static void thumb_take(Client *c)
+{
+	XWindowAttributes wa;
+	XRenderPictureAttributes pa = {.subwindow_mode = IncludeInferiors};
+	if (!c || tp_on || c->minimized || c->ws != curws || c->w < 8 || c->h < 8) return;
+	if (!XGetWindowAttributes(dpy, c->frame, &wa) || wa.map_state != IsViewable) return;
+	double s = MIN((double)TPW / c->w, (double)TPH / c->h);
+	int w = MAX((int)(c->w * s), 1), h = MAX((int)(c->h * s), 1);
+	if (c->thumb && (c->tw != w || c->tht != h)) thumb_free(c);
+	if (!c->thumb) {
+		c->thumb = XCreatePixmap(dpy, root, w, h, depth);
+		c->tpic = XRenderCreatePicture(dpy, c->thumb, fmt, 0, NULL);
+		c->tw = w; c->tht = h;
+	}
+	Picture src = XRenderCreatePicture(dpy, c->frame, fmt, CPSubwindowMode, &pa);
+	XTransform t = {{{XDoubleToFixed(1 / s), 0, 0}, {0, XDoubleToFixed(1 / s), 0}, {0, 0, XDoubleToFixed(1)}}};
+	XRenderSetPictureTransform(dpy, src, &t);
+	XRenderSetPictureFilter(dpy, src, FilterBilinear, NULL, 0);
+	XRenderComposite(dpy, PictOpSrc, src, None, c->tpic, 0, 0, 0, 0, 0, 0, w, h);
+	XRenderFreePicture(dpy, src);
+}
+
+static void tp_draw(void)
+{
+	buf_ensure(tp_w, tp_h);
+	fill(0, 0, tp_w, tp_h, th.border);
+	fill(1, 1, tp_w - 2, tp_h - 2, th.menu);
+	for (int i = 0; i < tp_n; i++) {
+		Client *c = tp_c[i];
+		int x = 8 + i * (TPCW + 6), y = 8, bx = x + 8, by = y + 32;
+		if (i == tp_hover) rrect(x, y, TPCW, TPCH, 6, th.hover, 255);
+		client_icon(c, x + 8, y + 6, 16);
+		textfit(F_sm, x + 30, y + 7, TPCW - 38 - (i == tp_hover ? 24 : 0), c->title[0] ? c->title : c->cls, th.text);
+		if (i == tp_hover) {
+			if (tp_xhov) rrect(x + TPCW - 30, y + 3, 26, 24, 4, 0xC42B1C, 255);
+			glyph(G_CLOSE, x + TPCW - 24, y + 8, 14, tp_xhov ? 0xFFFFFF : th.text);
+		}
+		if (c->thumb) XRenderComposite(dpy, PictOpSrc, c->tpic, None, B.pic, 0, 0, 0, 0,
+			bx + (TPW - c->tw) / 2, by + (TPH - c->tht) / 2, c->tw, c->tht);
+		else client_icon(c, bx + (TPW - 48) / 2, by + (TPH - 48) / 2, 48);
+	}
+	blit(tpwin, tp_w, tp_h);
+}
+
+static void tp_place(void)
+{
+	Mon *mo = &mons[tp_m];
+	tp_w = 16 + tp_n * TPCW + (tp_n - 1) * 6;
+	tp_h = 16 + TPCH;
+	int x = CLAMP(tp_cx - tp_w / 2, mo->x + 8, mo->x + mo->w - tp_w - 8);
+	int y = cfg.bar_top ? mo->y + TBH + 8 : mo->y + mo->h - TBH - tp_h - 8;
+	if (!tpwin) tpwin = popup_win();
+	XMoveResizeWindow(dpy, tpwin, x, y, tp_w, tp_h);
+	shape_round(tpwin, tp_w, tp_h, 8);
+	if (!tp_on) { tp_on = 1; XMapRaised(dpy, tpwin); restack(); }
+	tp_draw();
+}
+
+static void tp_show(int ti, int m)
+{
+	Group *g = &G[tbi[ti].g];
+	int maxn = MIN((int)LEN(tp_c), (mons[m].w - 16) / (TPCW + 6));
+	tp_n = 0;
+	for (int k = 0; k < g->n && tp_n < maxn; k++) {
+		Client *c = g->w[k];
+		if (c == sel || !c->thumb) thumb_take(c);
+		tp_c[tp_n++] = c;
+	}
+	if (!tp_n) { tp_close(); return; }
+	tp_g = tbi[ti].g; tp_m = m;
+	tp_cx = mons[m].x + tbi[ti].x + tbi[ti].w / 2;
+	tp_hover = -1; tp_xhov = 0; tp_due = tp_cdue = 0;
+	tp_place();
+}
+
+static void tp_close(void)
+{
+	tp_due = tp_cdue = 0;
+	if (!tp_on) return;
+	tp_on = 0;
+	XUnmapWindow(dpy, tpwin);
+}
+
+static void tp_drop(Client *c)
+{
+	for (int i = 0; i < tp_n; i++)
+		if (tp_c[i] == c) { memmove(&tp_c[i], &tp_c[i + 1], sizeof *tp_c * (size_t)(tp_n - i - 1)); tp_n--; break; }
+	if (!tp_on) return;
+	if (!tp_n) tp_close();
+	else { tp_hover = -1; tp_place(); }
+}
+
+static int tp_hit(int x, int y, int *xb)
+{
+	int i = (x - 8) / (TPCW + 6), cx = x - 8 - i * (TPCW + 6);
+	if (x < 8 || i >= tp_n || cx >= TPCW || y < 8 || y >= 8 + TPCH) return -1;
+	*xb = cx >= TPCW - 30 && y < 8 + 27;
+	return i;
+}
+
+static void tp_motion(int x, int y)
+{
+	int xb = 0, i = tp_hit(x, y, &xb);
+	tp_cdue = 0;
+	if (i != tp_hover || xb != tp_xhov) { tp_hover = i; tp_xhov = xb; tp_draw(); }
+}
+
+static void tp_press(XButtonEvent *e)
+{
+	int xb = 0, i = tp_hit(e->x, e->y, &xb);
+	if (i < 0) return;
+	Client *c = tp_c[i];
+	if (e->button == 2 || (e->button == 1 && xb)) close_client(c);
+	else if (e->button == 1) { activate(c); tp_close(); }
+}
+
+/* open after a short hover over an app with windows, close shortly after the pointer leaves */
+static void tp_bar_hover(int m, int h)
+{
+	if (h >= 0 && tbi[h].kind == TB_GROUP && G[tbi[h].g].n) {
+		tp_cdue = 0;
+		if (!tp_on) tp_due = now_ms() + 400;
+		else if (tbi[h].g != tp_g || m != tp_m) tp_show(h, m);
+	} else {
+		tp_due = 0;
+		if (tp_on) tp_cdue = now_ms() + 300;
+	}
+}
+
 static long long next_deadline(void)
 {
 	long long d = osd_until;
 	for (int i = 0; i < nnf; i++) if (nf[i].until && (!d || nf[i].until < d)) d = nf[i].until;
 	if (pj_due > 0 && (!d || pj_due < d)) d = pj_due;
+	if (tp_due && (!d || tp_due < d)) d = tp_due;
+	if (tp_cdue && (!d || tp_cdue < d)) d = tp_cdue;
 	return d;
 }
 
@@ -2639,6 +2802,11 @@ static void timers(void)
 	for (int i = 0; i < nnf; i++) if (nf[i].until && t >= nf[i].until) { nf[i].until = 0; nf_closed(nf[i].id, 1); ch = 1; }
 	if (ch) nf_changed();
 	if (pj_due > 0 && t >= pj_due) { pj_due = 0; rr_reconcile(); }
+	if (tp_due && t >= tp_due) {
+		tp_due = 0;
+		if (!grabbed && tb_hmon >= 0 && tb_hover >= 0 && (tb_layout(tb_hmon), tb_hover < ntbi) && tbi[tb_hover].kind == TB_GROUP) tp_show(tb_hover, tb_hmon);
+	}
+	if (tp_cdue && t >= tp_cdue) tp_close();
 }
 
 /* --- keyboard focus and moves by direction --- */
@@ -2725,6 +2893,7 @@ static void move_dir(Client *c, int dx, int dy)
 
 static void close_popups(void)
 {
+	tp_close();
 	nc_close();
 	pj_close();
 	tv_close();
@@ -2868,6 +3037,7 @@ static void ws_view(int n)
 {
 	long d = n;
 	if (n < 0 || n >= NWS || n == curws) return;
+	thumb_take(sel);
 	close_popups();
 	curws = n;
 	for (Client *c = clients; c; c = c->next) ws_sync(c);
@@ -3330,6 +3500,7 @@ popup:
 		return;
 	}
 	for (int k = 0; k < 3; k++) if (toast_id[k] && e->window == toastwin[k]) { toast_press(k, e); return; }
+	if (tp_on && e->window == tpwin) { tp_press(e); return; }
 	if ((c = bywin(e->window))) {
 		activate(c);
 		XAllowEvents(dpy, ReplayPointer, CurrentTime);
@@ -3398,9 +3569,10 @@ static void motion(XMotionEvent *e)
 		if (h != qs_hover) { qs_hover = h; qs_draw(); }
 		return;
 	}
+	if (tp_on && e->window == tpwin) { tp_motion(e->x, e->y); return; }
 	if ((m = monbar(e->window)) >= 0) {
 		int h = tb_hit(m, e->x);
-		if (h != tb_hover || m != tb_hmon) { tb_hover = h; tb_hmon = m; tb_draw(m); }
+		if (h != tb_hover || m != tb_hmon) { tb_hover = h; tb_hmon = m; tb_draw(m); tp_bar_hover(m, h); }
 		return;
 	}
 	if ((c = byframe(e->window))) {
@@ -3438,7 +3610,8 @@ static void leave(XCrossingEvent *e)
 	Client *c;
 	int m;
 	if ((c = byframe(e->window)) && c->hover && !c->press) { c->hover = 0; draw_frame(c); }
-	else if ((m = monbar(e->window)) >= 0 && tb_hover >= 0) { tb_hover = -1; tb_draw(m); }
+	else if ((m = monbar(e->window)) >= 0 && tb_hover >= 0) { tb_hover = -1; tb_draw(m); tp_bar_hover(m, -1); }
+	else if (tp_on && e->window == tpwin) { tp_hover = -1; tp_cdue = now_ms() + 300; tp_draw(); }
 	else if (sm_on && e->window == smwin && sm_hover >= 0) { sm_hover = -1; sm_draw(); }
 	else if (ctx_on && e->window == ctxwin && ctx_hover >= 0) { ctx_hover = -1; ctx_draw(); }
 	else if (qs_on && e->window == qswin && qs_hover >= 0) { qs_hover = -1; qs_draw(); }
@@ -3521,6 +3694,7 @@ static void expose(XExposeEvent *e)
 	else if (tv_on && e->window == tvwin) tv_draw();
 	else if (nc_on && (e->window == ncwin || e->window == calwin)) nc_draw();
 	else if (pj_on && e->window == pjwin) pj_draw();
+	else if (tp_on && e->window == tpwin) tp_draw();
 	else if (osd_until && e->window == osdwin) osd_draw();
 	else for (int k = 0; k < 3; k++) if (toast_id[k] && e->window == toastwin[k]) toast_paint(k);
 }

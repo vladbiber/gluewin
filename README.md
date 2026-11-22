@@ -4,6 +4,7 @@ A very light X11 window manager that looks and works like Windows 11, for people
 Plain C on Xlib/Xft/XRender: no toolkit, no compositor. About 160 KB on disk and ~14 MB RAM.
 
 - Centered taskbar with Start, Search, Task View, pinned apps, tray, keyboard language, clock and Show desktop
+- Hover an app in the taskbar to see its windows as thumbnails; click one to switch, X or middle click to close
 - Start menu with Pinned apps, All apps and search; power menu
 - Quick settings: Wi-Fi, Bluetooth, dark mode, brightness, volume, battery
 - Rounded windows with Windows-style title buttons, Snap (drag to top or sides), Alt+Tab
