@@ -2715,7 +2715,7 @@ static void move_dir(Client *c, int dx, int dy)
 		if (n) tile_swap(c, n);
 		else if ((t = mon_dir(mon_of(c), dx, dy)) >= 0) { c->tord = ++tordctr; to_mon(c, t); }
 	} else if (dy < 0) { if (c->snap) set_max(c, 0); set_max(c, 1); }
-	else if (dy > 0) { if (c->max || c->snap) set_max(c, 0); else { minimize(c); return; } }
+	else if (dy > 0) { if (c->max || c->snap) set_max(c, 0); else if (!tilews[c->ws]) { minimize(c); return; } }
 	else if (c->snap == 3 - side) set_max(c, 0);
 	else if (c->snap == side) { if ((t = mon_dir(mon_of(c), dx, 0)) >= 0) { c->snap = 3 - side; to_mon(c, t); } }
 	else set_snap(c, side);
