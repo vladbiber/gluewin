@@ -1,4 +1,5 @@
 #include "common.h"
+#include <dbus/dbus.h>
 
 enum { TH = 32, BW = 1, BTNW = 46, TBH = 48, HDL = 6, MAXMON = 8, RAD = 8, NWS = 9, GAP = 6 };
 enum { DL = 1, DR = 2, DT = 4, DB = 8 };
@@ -63,14 +64,31 @@ static int ng;
 static TbItem tbi[96];
 static int ntbi, tb_hmon = -1, tb_hover = -1;
 
-static struct { int on, mode, dir, px, py, ox, oy, ow, oh, moved, zone; Client *c; } drag;
+static struct { int on, mode, dir, px, py, ox, oy, ow, oh, moved, zone, tiled; Client *c; } drag;
 static Window snapwin;
+static Client *drag_tgt;
+static float mfact = .55f;
 
 /* popups */
 static int grabbed;
 static Window smwin, ctxwin, qswin, atwin;
 static int sm_on, ctx_on, qs_on, at_on, tv_on, tv_hover = -1, tv_n, tv_ws[NWS + 1], tv_w, tv_h;
 static Window tvwin;
+static struct { int x, y; Client *c; } tvi[NWS * 10 + 10];
+static int ntvi, tv_px, tv_py, tv_mx, tv_my, tv_moved, tv_x, tv_y, tv_m;
+static Client *tv_dc;
+static Window ncwin, calwin, pjwin, osdwin, toastwin[3];
+static int nc_on, nc_m, nc_h, nc_hover = -1, nc_rows[8], nc_nrows, cal_year, cal_mon;
+static int pj_on, pj_sel, pj_cur, osd_g, osd_p, qs_fd = -1, qs_blen, bus_fd = -1;
+static unsigned toast_id[3];
+static long long osd_until, pj_due;
+static FILE *qs_fp;
+static char qs_buf[256];
+static DBusConnection *bus;
+typedef struct { unsigned id; char app[64], sum[160], body[320]; int act; long long until; } Notif;
+static Notif nf[20];
+static int nnf;
+static unsigned nf_ctr;
 static int sm_mode, sm_sel, sm_scroll, sm_hover = -1, sm_mon, SMW = 640, SMH = 700, sm_x, sm_y;
 static char sm_q[128];
 static int sm_res[1024], sm_nres;
@@ -103,6 +121,11 @@ static void sm_draw(void);
 static void apply(Client *c);
 static void arrange(void);
 static void ws_view(int n);
+static void ws_move(Client *c, int n);
+static void nc_close(void);
+static void pj_close(void);
+static void tv_place(void);
+static void tv_draw(void);
 
 static int xerror(Display *d, XErrorEvent *e)
 {
@@ -405,7 +428,7 @@ static void draw_frame(Client *c)
 
 static void place_handles(Client *c)
 {
-	if (!resizable(c) || !c->deco) {
+	if (!resizable(c) || !c->deco || c->ws != curws) {
 		for (int i = 0; i < 4; i++) XUnmapWindow(dpy, c->hdl[i]);
 		return;
 	}
@@ -530,7 +553,7 @@ static void arrange(void)
 		if (!(n = tiled_on(m, t, 64))) continue;
 		workarea(m, &x, &y, &w, &h);
 		x += GAP; y += GAP; w -= 2 * GAP; h -= 2 * GAP;
-		mw = n > 1 ? w * 55 / 100 : w;
+		mw = n > 1 ? (int)(w * mfact) : w;
 		for (i = 0; i < n; i++) {
 			Client *c = t[i];
 			int nx, ny, nw, nh;
@@ -550,14 +573,16 @@ static void arrange(void)
 	}
 }
 
-static void tile_swap(Client *c, int dir)
+static void tile_swap(Client *a, Client *b)
 {
-	Client *t[64];
-	int n = tiled_on(mon_of(c), t, 64), i, k;
-	for (i = 0; i < n && t[i] != c; i++);
-	k = i + dir;
-	if (i == n || k < 0 || k >= n) return;
-	int o = c->tord; c->tord = t[k]->tord; t[k]->tord = o;
+	int t = a->tord;
+	a->tord = b->tord; b->tord = t;
+	/* across monitors the geometry decides the monitor, so swap it too */
+	if (mon_of(a) != mon_of(b)) {
+		int x = a->x, y = a->y, w = a->w, h = a->h;
+		a->x = b->x; a->y = b->y; a->w = b->w; a->h = b->h;
+		b->x = x; b->y = y; b->w = w; b->h = h;
+	}
 	arrange();
 }
 
@@ -579,14 +604,18 @@ static void raise_client(Client *c)
 static void restack(void)
 {
 	Window w[2048];
-	int n = 0, i, k;
-	if (sel && sel->full && !sel->minimized) w[n++] = sel->frame;
+	int n = 0, i, k, full = sel && sel->full && !sel->minimized;
+	for (i = 0; i < 3; i++) if (toast_id[i]) w[n++] = toastwin[i];
+	if (osd_until) w[n++] = osdwin;
+	if (pj_on) w[n++] = pjwin;
+	if (nc_on) { w[n++] = ncwin; w[n++] = calwin; }
 	if (sm_on) w[n++] = smwin;
 	if (ctx_on) w[n++] = ctxwin;
 	if (qs_on) w[n++] = qswin;
 	if (at_on) w[n++] = atwin;
 	if (tv_on) w[n++] = tvwin;
 	if (drag.on && snapwin) w[n++] = snapwin;
+	if (full) w[n++] = sel->frame;
 	for (i = 0; i < nmons; i++) w[n++] = mons[i].bar;
 	for (i = 0; i < ndocks; i++) w[n++] = docks[i];
 	for (i = nz - 1; i >= 0 && n < 2040; i--) {
@@ -594,13 +623,6 @@ static void restack(void)
 		if (c == sel && c->full) continue;
 		w[n++] = c->frame;
 		for (k = 0; k < 4; k++) w[n++] = c->hdl[k];
-	}
-	if (sel && sel->full && !sel->minimized) {
-		/* popups opened over a fullscreen window stay on top of it */
-		memmove(w, w + 1, sizeof *w * (size_t)(n - 1));
-		k = (sm_on + ctx_on + qs_on + at_on + tv_on);
-		memmove(w + k + 1, w + k, sizeof *w * (size_t)(n - 1 - k));
-		w[k] = sel->frame;
 	}
 	if (n) {
 		XRaiseWindow(dpy, w[0]);
@@ -676,11 +698,11 @@ static void activate(Client *c)
 	if (c->ws != curws) ws_view(c->ws);
 	if (c->minimized) {
 		c->minimized = 0;
+		arrange();
 		XMapWindow(dpy, c->frame);
 		place_handles(c);
 		set_wm_state(c, NormalState);
 		ewmh_state(c);
-		arrange();
 	}
 	raise_client(c);
 	focus(c);
@@ -773,12 +795,12 @@ static void manage(Window w, XWindowAttributes *wa)
 	long desk = curws;
 	XChangeProperty(dpy, w, A[NetWMDesktop], XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&desk, 1);
 	set_wm_state(c, NormalState);
-	apply(c);
-	XMapWindow(dpy, w);
-	XMapWindow(dpy, c->frame);
 	if (has_state(w, A[NetWMFullscreen])) set_full(c, 1);
 	else if (has_state(w, A[NetWMMaxV]) && has_state(w, A[NetWMMaxH])) set_max(c, 1);
+	else apply(c);
 	arrange();
+	XMapWindow(dpy, w);
+	XMapWindow(dpy, c->frame);
 	restack();
 	focus(c);
 }
@@ -790,6 +812,8 @@ static void unmanage(Client *c, int destroyed)
 	if (*pp) *pp = c->next;
 	z_remove(c);
 	for (int i = 0; i < sd_n; i++) if (sd_list[i] == c) sd_list[i] = sd_list[--sd_n];
+	if (drag_tgt == c) drag_tgt = NULL;
+	if (tv_dc == c) tv_dc = NULL;
 	if (drag.c == c) { drag.on = 0; drag.c = NULL; XUngrabPointer(dpy, CurrentTime); if (snapwin) XUnmapWindow(dpy, snapwin); }
 	if (at_on) for (int i = 0; i < at_n; i++) if (at_list[i] == c) { memmove(&at_list[i], &at_list[i + 1], sizeof *at_list * (size_t)(at_n - i - 1)); at_n--; at_sel = at_n ? at_sel % at_n : 0; }
 	if (!destroyed) {
@@ -812,6 +836,7 @@ static void unmanage(Client *c, int destroyed)
 	ewmh_lists();
 	tb_draw_all();
 	if (at_on && !at_n) { at_on = 0; XUnmapWindow(dpy, atwin); }
+	if (tv_on) { tv_place(); tv_draw(); }
 }
 
 /* ---------- taskbar ---------- */
@@ -955,7 +980,7 @@ static void tb_layout(int m)
 	rx = mw - 12;
 	tbi[ntbi++] = (TbItem){TB_DESK, rx, 12, 0};
 	clock_str(t, sizeof t, d, sizeof d);
-	int cw = MAX(tw(F_sm, t), tw(F_sm, d)) + 20;
+	int cw = MAX(tw(F_sm, t), tw(F_sm, d)) + 20 + (nnf ? 22 : 0);
 	rx -= cw + 2;
 	tbi[ntbi++] = (TbItem){TB_CLOCK, rx, cw, 0};
 	int sw = (battery(NULL) >= 0 ? 3 : 2) * 24 + 12;
@@ -1039,8 +1064,17 @@ static void tb_draw(int m)
 			break;
 		case TB_CLOCK:
 			clock_str(t, sizeof t, d, sizeof d);
+			if (nc_on) rrect(it->x, 4, it->w, 40, 5, th.hover, 255);
+			if (nnf) {
+				char nb[8];
+				snprintf(nb, sizeof nb, "%d", MIN(nnf, 9));
+				rrect(it->x + it->w - 26, 14, 20, 20, 10, th.accent, 255);
+				textc(F_sm, it->x + it->w - 26, 14 + (20 - fh(F_sm)) / 2, 20, nb, th.onaccent);
+				it->w -= 22;
+			}
 			text(F_sm, it->x + it->w - 10 - tw(F_sm, t), 7, t, th.text);
 			text(F_sm, it->x + it->w - 10 - tw(F_sm, d), 25, d, th.text);
+			if (nnf) it->w += 22;
 			break;
 		case TB_DESK:
 			fill(it->x, 14, 1, 20, th.line);
@@ -1165,7 +1199,7 @@ static void grab_input(void)
 
 static void ungrab_input(void)
 {
-	if (!grabbed || sm_on || ctx_on || qs_on || at_on || tv_on) return;
+	if (!grabbed || sm_on || ctx_on || qs_on || at_on || tv_on || nc_on || pj_on) return;
 	XUngrabPointer(dpy, CurrentTime);
 	XUngrabKeyboard(dpy, CurrentTime);
 	grabbed = 0;
@@ -1733,13 +1767,34 @@ static void qs_apply(int which, int pct, int final)
 	else { snprintf(cmd, sizeof cmd, "brightnessctl -q set %d%%", MAX(pct, 1)); spawn(cmd); }
 }
 
+/* Wi-Fi and Bluetooth state is read in the background so the panel opens at once */
+static void qs_probe(void)
+{
+	if (qs_fp || !(qs_fp = popen("nmcli radio wifi 2>/dev/null; timeout 1 bluetoothctl show 2>/dev/null | grep -q 'Powered: yes' && echo bt-on", "re"))) return;
+	qs_fd = fileno(qs_fp);
+	fcntl(qs_fd, F_SETFL, O_NONBLOCK);
+	qs_blen = 0;
+}
+
+static void qs_probe_read(void)
+{
+	ssize_t r = read(qs_fd, qs_buf + qs_blen, sizeof qs_buf - 1 - (size_t)qs_blen);
+	if (r < 0 && errno == EAGAIN) return;
+	if (r > 0 && (qs_blen += (int)r) < (int)sizeof qs_buf - 1) return;
+	qs_buf[qs_blen] = 0;
+	pclose(qs_fp);
+	qs_fp = NULL;
+	qs_fd = -1;
+	qs_wifi = !strncmp(qs_buf, "enabled", 7);
+	qs_bt = strstr(qs_buf, "bt-on") != NULL;
+	if (qs_on) qs_draw();
+}
+
 static void qs_open(void)
 {
-	char b[512];
 	int m = 0, x;
 	close_popups();
-	qs_wifi = run_read("nmcli radio wifi 2>/dev/null", b, sizeof b) && !strncmp(b, "enabled", 7);
-	qs_bt = run_read("timeout 1 bluetoothctl show 2>/dev/null", b, sizeof b) && strstr(b, "Powered: yes");
+	qs_probe();
 	qs_vol = volume_get(&qs_muted);
 	qs_bri = backlight(&qs_brimax, qs_bldev, sizeof qs_bldev);
 	qs_h = 16 + 60 + 20 + (qs_bri >= 0 ? 44 : 0) + 44 + 8 + 52;
@@ -1787,6 +1842,13 @@ static int stamp_cmp(const void *a, const void *b)
 	return x < y ? 1 : x > y ? -1 : 0;
 }
 
+static void client_icon(Client *c, int x, int y, int sz)
+{
+	if (c->hasicon) icon_draw(&c->ic, x, y, sz);
+	else if (c->app && app_icon(c->app)) icon_draw(&c->app->ic, x, y, sz);
+	else letter_tile(c->title[0] ? c->title : c->cls, x, y, sz);
+}
+
 static void at_draw(void)
 {
 	int cw = 128, W = at_n * cw + 24, H = 150, i;
@@ -1797,9 +1859,7 @@ static void at_draw(void)
 		Client *c = at_list[i];
 		int x = 12 + i * cw;
 		if (i == at_sel) { rrect(x + 2, 10, cw - 4, H - 20, 8, th.accent, 255); rrect(x + 5, 13, cw - 10, H - 26, 6, th.hover, 255); }
-		if (c->hasicon) icon_draw(&c->ic, x + (cw - 48) / 2, 30, 48);
-		else if (c->app && app_icon(c->app)) icon_draw(&c->app->ic, x + (cw - 48) / 2, 30, 48);
-		else letter_tile(c->title[0] ? c->title : c->cls, x + (cw - 48) / 2, 30, 48);
+		client_icon(c, x + (cw - 48) / 2, 30, 48);
 		textc(F_sm, x + 10, 96, cw - 20, c->title[0] ? c->title : c->cls, th.text);
 	}
 	blit(atwin, W, H);
@@ -1849,6 +1909,7 @@ static void tv_draw(void)
 {
 	int i, x;
 	char t[64];
+	ntvi = 0;
 	buf_ensure(tv_w, tv_h);
 	fill(0, 0, tv_w, tv_h, th.border);
 	fill(1, 1, tv_w - 2, tv_h - 2, th.menu);
@@ -1868,12 +1929,13 @@ static void tv_draw(void)
 			if (c->ws != ws || c->skiptb) continue;
 			int ix = x + 14 + (k % 5) * 36, iy = 58 + (k / 5) * 38;
 			if (k++ >= 10) break;
-			if (c->hasicon) icon_draw(&c->ic, ix, iy, 28);
-			else if (c->app && app_icon(c->app)) icon_draw(&c->app->ic, ix, iy, 28);
-			else letter_tile(c->title[0] ? c->title : c->cls, ix, iy, 28);
+			if (ntvi < (int)LEN(tvi)) tvi[ntvi++] = (typeof(tvi[0])){ix, iy, c};
+			if (c == tv_dc && tv_moved) rrect(ix, iy, 28, 28, 6, th.hover, 255);
+			else client_icon(c, ix, iy, 28);
 		}
 		if (!k) text(F_sm, x + 14, 64, T("No windows", "Nicio fereastră"), th.sub);
 	}
+	if (tv_dc && tv_moved) client_icon(tv_dc, tv_mx - 14, tv_my - 14, 28);
 	blit(tvwin, tv_w, tv_h);
 }
 
@@ -1881,15 +1943,15 @@ static void tv_close(void)
 {
 	if (!tv_on) return;
 	tv_on = 0;
+	tv_dc = NULL;
 	XUnmapWindow(dpy, tvwin);
 	ungrab_input();
 	tb_draw_all();
 }
 
-static void tv_open(int m)
+static void tv_place(void)
 {
-	int used = 1 << curws, i;
-	close_popups();
+	int used = 1 << curws, i, m = MIN(tv_m, nmons - 1);
 	for (Client *c = clients; c; c = c->next) if (!c->skiptb) used |= 1 << c->ws;
 	tv_n = 0;
 	for (i = 0; i < NWS; i++) if ((used >> i) & 1) tv_ws[tv_n++] = i;
@@ -1897,8 +1959,17 @@ static void tv_open(int m)
 	tv_w = MIN(tv_n * (TVW + 12) + 20, mons[m].w - 24);
 	tv_h = TVH + 32;
 	if (!tvwin) tvwin = popup_win();
-	XMoveResizeWindow(dpy, tvwin, mons[m].x + (mons[m].w - tv_w) / 2, pop_y(m, tv_h), tv_w, tv_h);
+	tv_x = mons[m].x + (mons[m].w - tv_w) / 2;
+	tv_y = pop_y(m, tv_h);
+	XMoveResizeWindow(dpy, tvwin, tv_x, tv_y, tv_w, tv_h);
 	shape_round(tvwin, tv_w, tv_h, 8);
+}
+
+static void tv_open(int m)
+{
+	close_popups();
+	tv_m = m;
+	tv_place();
 	tv_on = 1;
 	tv_hover = -1;
 	XMapRaised(dpy, tvwin);
@@ -1914,21 +1985,747 @@ static int tv_hit(int x, int y)
 	return -1;
 }
 
+static int free_ws(void)
+{
+	int used = 1 << curws, ws;
+	for (Client *c = clients; c; c = c->next) used |= 1 << c->ws;
+	for (ws = 0; ws < NWS && ((used >> ws) & 1); ws++);
+	return ws < NWS ? ws : -1;
+}
+
 static void tv_pick(int i)
 {
-	int ws = tv_ws[i];
-	if (ws < 0) {
-		int used = 0;
-		for (Client *c = clients; c; c = c->next) used |= 1 << c->ws;
-		for (ws = 0; ws < NWS && (ws == curws || ((used >> ws) & 1)); ws++);
-		if (ws == NWS) return;
-	}
+	int ws = tv_ws[i] < 0 ? free_ws() : tv_ws[i];
+	if (ws < 0) return;
 	tv_close();
 	ws_view(ws);
 }
 
+/* pressing a window icon starts a drag; a plain click switches to that window */
+static void tv_press(int x, int y)
+{
+	int i;
+	for (i = 0; i < ntvi; i++)
+		if (x >= tvi[i].x && x < tvi[i].x + 28 && y >= tvi[i].y && y < tvi[i].y + 28) {
+			tv_dc = tvi[i].c; tv_px = x; tv_py = y; tv_moved = 0;
+			return;
+		}
+	if ((i = tv_hit(x, y)) >= 0) tv_pick(i);
+}
+
+static void tv_release(int xr, int yr)
+{
+	Client *c = tv_dc;
+	int i, ws;
+	tv_dc = NULL;
+	if (!tv_moved) { tv_close(); activate(c); return; }
+	if ((i = tv_hit(xr - tv_x, yr - tv_y)) >= 0 && (ws = tv_ws[i] < 0 ? free_ws() : tv_ws[i]) >= 0) ws_move(c, ws);
+	tv_place();
+	tv_draw();
+}
+
+/* --- volume / brightness pill --- */
+
+enum { OSDW = 196, OSDH = 48 };
+
+static void osd_draw(void)
+{
+	int tx = 52, tw2 = OSDW - 52 - 22;
+	buf_ensure(OSDW, OSDH);
+	fill(0, 0, OSDW, OSDH, th.border);
+	rrect(1, 1, OSDW - 2, OSDH - 2, OSDH / 2 - 1, th.menu, 255);
+	glyph(osd_g, 18, 14, 20, th.text);
+	rrect(tx, 22, tw2, 4, 2, cfg.dark ? 0x9A9A9A : 0x8A8A8A, 255);
+	if (osd_p > 0) rrect(tx, 22, MAX(tw2 * osd_p / 100, 4), 4, 2, th.accent, 255);
+	blit(osdwin, OSDW, OSDH);
+}
+
+static void osd_show(int g, int pct)
+{
+	int m = pointer_mon();
+	if (!osdwin) {
+		osdwin = popup_win();
+		XResizeWindow(dpy, osdwin, OSDW, OSDH);
+		shape_round(osdwin, OSDW, OSDH, OSDH / 2);
+		XShapeCombineRectangles(dpy, osdwin, ShapeInput, 0, 0, NULL, 0, ShapeSet, Unsorted);
+	}
+	osd_g = g;
+	osd_p = CLAMP(pct, 0, 100);
+	XMoveWindow(dpy, osdwin, mons[m].x + (mons[m].w - OSDW) / 2,
+		cfg.bar_top ? mons[m].y + TBH + 24 : mons[m].y + mons[m].h - TBH - 24 - OSDH);
+	XMapRaised(dpy, osdwin);
+	osd_draw();
+	osd_until = now_ms() + 1500;
+}
+
+static void media_key(KeySym ks)
+{
+	char cmd[64], dev[64];
+	int mu, v, mx;
+	switch (ks) {
+	case XF86XK_AudioRaiseVolume: case XF86XK_AudioLowerVolume:
+		if ((v = volume_get(&mu)) < 0) break;
+		v = CLAMP(v + (ks == XF86XK_AudioRaiseVolume ? 5 : -5), 0, 100);
+		volume_set(v);
+		osd_show(v ? G_VOL : G_MUTE, v);
+		if (qs_on) { qs_vol = v; qs_muted = 0; qs_draw(); }
+		break;
+	case XF86XK_AudioMute:
+		v = volume_get(&mu);
+		spawn(have("wpctl") ? "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle" : "pactl set-sink-mute @DEFAULT_SINK@ toggle");
+		osd_show(mu ? G_VOL : G_MUTE, mu ? v : 0);
+		if (qs_on) { qs_muted = !mu; qs_draw(); }
+		break;
+	case XF86XK_MonBrightnessUp: case XF86XK_MonBrightnessDown:
+		if ((v = backlight(&mx, dev, sizeof dev)) < 0 || mx <= 0) {
+			spawn(ks == XF86XK_MonBrightnessUp ? "brightnessctl -q set 5%+" : "brightnessctl -q set 5%-");
+			break;
+		}
+		v = CLAMP((v * 100 + mx / 2) / mx + (ks == XF86XK_MonBrightnessUp ? 5 : -5), 1, 100);
+		snprintf(cmd, sizeof cmd, "brightnessctl -q set %d%%", v);
+		spawn(cmd);
+		osd_show(G_SUN, v);
+		if (qs_on) { qs_bri = qs_brimax * v / 100; qs_draw(); }
+		break;
+	}
+}
+
+/* --- notifications (org.freedesktop.Notifications) --- */
+
+enum { TOW = 364, TOH = 84, NCW = 360, NCI = 84, CALH = 380 };
+#define NF_PATH "/org/freedesktop/Notifications"
+#define NF_IF "org.freedesktop.Notifications"
+
+static void nc_layout(void);
+static void nc_draw(void);
+
+static void nf_signal(const char *name, unsigned id, int t2, const void *v2)
+{
+	DBusMessage *s;
+	if (!bus || !(s = dbus_message_new_signal(NF_PATH, NF_IF, name))) return;
+	dbus_message_append_args(s, DBUS_TYPE_UINT32, &id, t2, v2, DBUS_TYPE_INVALID);
+	dbus_connection_send(bus, s, NULL);
+	dbus_message_unref(s);
+}
+
+static void nf_closed(unsigned id, unsigned reason) { nf_signal("NotificationClosed", id, DBUS_TYPE_UINT32, &reason); }
+static void nf_action(unsigned id) { const char *k = "default"; nf_signal("ActionInvoked", id, DBUS_TYPE_STRING, &k); }
+
+static int nf_find(unsigned id)
+{
+	for (int i = 0; i < nnf; i++) if (nf[i].id == id) return i;
+	return -1;
+}
+
+static void nf_remove(int i, unsigned reason)
+{
+	nf_closed(nf[i].id, reason);
+	memmove(&nf[i], &nf[i + 1], sizeof *nf * (size_t)(nnf - i - 1));
+	nnf--;
+}
+
+/* drops markup tags and the common entities, keeps whole UTF-8 characters */
+static void plain(char *d, size_t n, const char *s)
+{
+	static const char *ent[][2] = {{"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", "\""}, {"&apos;", "'"}};
+	size_t k = 0;
+	while (*s && k + 1 < n) {
+		const char *e;
+		int j;
+		if (*s == '<' && (e = strchr(s, '>'))) { s = e + 1; continue; }
+		for (j = 0; *s == '&' && j < 5 && strncmp(s, ent[j][0], strlen(ent[j][0])); j++);
+		if (*s == '&' && j < 5) { d[k++] = ent[j][1][0]; s += strlen(ent[j][0]); continue; }
+		d[k++] = *s == '\n' || *s == '\t' ? ' ' : *s;
+		s++;
+	}
+	if (*s) while (k && ((unsigned char)d[k - 1] & 0xC0) == 0x80) k--;
+	if (*s && k && (unsigned char)d[k - 1] >= 0xC0) k--;
+	d[k] = 0;
+}
+
+static void nf_card(Notif *n, int x, int y, int w)
+{
+	const char *app = n->app[0] ? n->app : T("Notification", "Notificare");
+	letter_tile(app, x + 12, y + 12, 16);
+	textfit(F_sm, x + 36, y + 12 + (16 - fh(F_sm)) / 2, w - 80, app, th.sub);
+	glyph(G_CLOSE, x + w - 28, y + 13, 14, th.sub);
+	textfit(F_ui, x + 12, y + 34, w - 24, n->sum, th.text);
+	textfit(F_sm, x + 12, y + 56, w - 24, n->body, th.sub);
+}
+
+static void toast_paint(int k)
+{
+	int i = nf_find(toast_id[k]);
+	if (i < 0) return;
+	buf_ensure(TOW, TOH);
+	fill(0, 0, TOW, TOH, th.border);
+	fill(1, 1, TOW - 2, TOH - 2, th.menu);
+	nf_card(&nf[i], 0, 0, TOW);
+	blit(toastwin[k], TOW, TOH);
+}
+
+static void toasts_draw(void)
+{
+	int k = 0, i;
+	for (i = nnf - 1; i >= 0 && k < 3; i--) {
+		if (!nf[i].until) continue;
+		if (!toastwin[k]) {
+			toastwin[k] = popup_win();
+			XResizeWindow(dpy, toastwin[k], TOW, TOH);
+			shape_round(toastwin[k], TOW, TOH, 8);
+		}
+		XMoveWindow(dpy, toastwin[k], mons[0].x + mons[0].w - TOW - 12, cfg.bar_top ?
+			mons[0].y + TBH + 12 + k * (TOH + 8) : mons[0].y + mons[0].h - TBH - 12 - TOH - k * (TOH + 8));
+		toast_id[k] = nf[i].id;
+		XMapRaised(dpy, toastwin[k]);
+		toast_paint(k);
+		k++;
+	}
+	for (; k < 3; k++) if (toast_id[k]) { toast_id[k] = 0; XUnmapWindow(dpy, toastwin[k]); }
+	restack();
+}
+
+static void nf_changed(void)
+{
+	toasts_draw();
+	if (nc_on) { nc_layout(); nc_draw(); }
+	tb_draw_all();
+}
+
+static void toast_press(int k, XButtonEvent *e)
+{
+	int i = nf_find(toast_id[k]);
+	if (i < 0) return;
+	if (e->x >= TOW - 40 && e->y < 36) nf[i].until = 0;
+	else if (e->button == 1) { if (nf[i].act) nf_action(nf[i].id); nf_remove(i, 2); }
+	else nf[i].until = 0;
+	nf_changed();
+}
+
+static int iget(DBusMessageIter *it, int type, void *v)
+{
+	if (dbus_message_iter_get_arg_type(it) != type) return 0;
+	dbus_message_iter_get_basic(it, v);
+	dbus_message_iter_next(it);
+	return 1;
+}
+
+static DBusMessage *nf_notify(DBusMessage *msg)
+{
+	DBusMessageIter it, a;
+	const char *app, *icon, *sum, *body, *key;
+	unsigned rep, id;
+	int exp = -1, act = 0, i, k;
+	DBusMessage *r;
+	if (!dbus_message_iter_init(msg, &it) || !iget(&it, DBUS_TYPE_STRING, &app) || !iget(&it, DBUS_TYPE_UINT32, &rep) ||
+		!iget(&it, DBUS_TYPE_STRING, &icon) || !iget(&it, DBUS_TYPE_STRING, &sum) || !iget(&it, DBUS_TYPE_STRING, &body))
+		return dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "bad arguments");
+	if (dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_ARRAY) {
+		dbus_message_iter_recurse(&it, &a);
+		for (k = 0; iget(&a, DBUS_TYPE_STRING, &key); k++) if (!(k & 1) && !strcmp(key, "default")) act = 1;
+		dbus_message_iter_next(&it);
+	}
+	dbus_message_iter_next(&it);
+	iget(&it, DBUS_TYPE_INT32, &exp);
+	if ((i = rep ? nf_find(rep) : -1) < 0) {
+		if (nnf == (int)LEN(nf)) { memmove(nf, nf + 1, sizeof *nf * (LEN(nf) - 1)); nnf--; }
+		i = nnf++;
+		if (!++nf_ctr) nf_ctr = 1;
+		nf[i].id = nf_ctr;
+	}
+	snprintf(nf[i].app, sizeof nf[i].app, "%s", app);
+	plain(nf[i].sum, sizeof nf[i].sum, sum);
+	plain(nf[i].body, sizeof nf[i].body, body);
+	nf[i].act = act;
+	/* shortcut: expire 0 ("never") is capped at 25 s on screen, it stays in the center */
+	nf[i].until = now_ms() + (exp > 0 ? MIN(exp, 60000) : exp == 0 ? 25000 : 5000);
+	id = nf[i].id;
+	nf_changed();
+	if ((r = dbus_message_new_method_return(msg))) dbus_message_append_args(r, DBUS_TYPE_UINT32, &id, DBUS_TYPE_INVALID);
+	return r;
+}
+
+static void bus_pump(void)
+{
+	DBusMessage *m, *r;
+	if (!bus) return;
+	if (!dbus_connection_read_write(bus, 0) || !dbus_connection_get_is_connected(bus)) {
+		dbus_connection_unref(bus);
+		bus = NULL;
+		bus_fd = -1;
+		return;
+	}
+	while ((m = dbus_connection_pop_message(bus))) {
+		r = NULL;
+		if (dbus_message_is_method_call(m, NF_IF, "Notify")) r = nf_notify(m);
+		else if (dbus_message_is_method_call(m, NF_IF, "GetCapabilities")) {
+			const char *caps[] = {"body", "actions"}, **cp = caps;
+			if ((r = dbus_message_new_method_return(m))) dbus_message_append_args(r, DBUS_TYPE_ARRAY, DBUS_TYPE_STRING, &cp, 2, DBUS_TYPE_INVALID);
+		} else if (dbus_message_is_method_call(m, NF_IF, "GetServerInformation")) {
+			const char *a = "gluewin", *b = "Glue", *c = "0.2", *d = "1.2";
+			if ((r = dbus_message_new_method_return(m)))
+				dbus_message_append_args(r, DBUS_TYPE_STRING, &a, DBUS_TYPE_STRING, &b, DBUS_TYPE_STRING, &c, DBUS_TYPE_STRING, &d, DBUS_TYPE_INVALID);
+		} else if (dbus_message_is_method_call(m, NF_IF, "CloseNotification")) {
+			DBusMessageIter it;
+			unsigned id = 0;
+			int i;
+			if (dbus_message_iter_init(m, &it) && iget(&it, DBUS_TYPE_UINT32, &id) && (i = nf_find(id)) >= 0) { nf_remove(i, 3); nf_changed(); }
+			r = dbus_message_new_method_return(m);
+		} else if (dbus_message_get_type(m) == DBUS_MESSAGE_TYPE_METHOD_CALL && !dbus_message_get_no_reply(m))
+			r = dbus_message_new_error(m, DBUS_ERROR_UNKNOWN_METHOD, "unknown method");
+		if (r) { dbus_connection_send(bus, r, NULL); dbus_message_unref(r); }
+		dbus_message_unref(m);
+	}
+	dbus_connection_flush(bus);
+}
+
+static void bus_setup(void)
+{
+	DBusError err;
+	if (!getenv("DBUS_SESSION_BUS_ADDRESS")) return;
+	dbus_error_init(&err);
+	if (!(bus = dbus_bus_get(DBUS_BUS_SESSION, &err))) { dbus_error_free(&err); return; }
+	dbus_connection_set_exit_on_disconnect(bus, FALSE);
+	/* another notification daemon (dunst, mako...) keeps the name */
+	if (dbus_bus_request_name(bus, NF_IF, DBUS_NAME_FLAG_DO_NOT_QUEUE, &err) != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER ||
+		!dbus_connection_get_unix_fd(bus, &bus_fd)) {
+		dbus_error_free(&err);
+		dbus_connection_unref(bus);
+		bus = NULL;
+		bus_fd = -1;
+		return;
+	}
+	bus_pump();
+}
+
+/* --- clock flyout: notification center above a calendar --- */
+
+static int nc_x(void) { return mons[nc_m].x + mons[nc_m].w - NCW - 12; }
+
+static int cal_top(void)
+{
+	return cfg.bar_top ? mons[nc_m].y + TBH + 24 + nc_h : mons[nc_m].y + mons[nc_m].h - TBH - 12 - CALH;
+}
+
+static void nc_layout(void)
+{
+	int x, y, w, h, fit, i;
+	nc_m = MIN(nc_m, nmons - 1);
+	workarea(nc_m, &x, &y, &w, &h);
+	fit = CLAMP((h - 24 - CALH - 12 - 56) / NCI, 0, (int)LEN(nc_rows));
+	nc_nrows = 0;
+	for (i = nnf - 1; i >= 0 && nc_nrows < fit; i--) nc_rows[nc_nrows++] = i;
+	nc_h = 48 + (nc_nrows ? nc_nrows * NCI + 6 : 56);
+	XMoveResizeWindow(dpy, ncwin, nc_x(), cfg.bar_top ? mons[nc_m].y + TBH + 12 : cal_top() - 12 - nc_h, NCW, nc_h);
+	shape_round(ncwin, NCW, nc_h, 8);
+}
+
+static void cal_draw(void)
+{
+	static const char *wen[7] = {"Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"}, *wro[7] = {"Lu", "Ma", "Mi", "Jo", "Vi", "Sâ", "Du"};
+	time_t t = time(NULL);
+	struct tm now = *localtime(&t), f = {0}, l;
+	char s[64];
+	int cw = (NCW - 24) / 7, first = RO ? 1 : 0, off, nd, pd, r, c;
+	buf_ensure(NCW, CALH);
+	fill(0, 0, NCW, CALH, th.border);
+	fill(1, 1, NCW - 2, CALH - 2, th.menu);
+	strftime(s, sizeof s, RO ? "%A, %-d %B" : "%A, %B %-d", &now);
+	text(F_ui, 16, (48 - fh(F_ui)) / 2, s, th.text);
+	fill(1, 48, NCW - 2, 1, th.border);
+	f.tm_year = cal_year; f.tm_mon = cal_mon; f.tm_mday = 1; f.tm_hour = 12; f.tm_isdst = -1;
+	mktime(&f);
+	l = f; l.tm_mon++; l.tm_mday = 0; mktime(&l); nd = l.tm_mday;
+	l = f; l.tm_mday = 0; mktime(&l); pd = l.tm_mday;
+	strftime(s, sizeof s, "%B %Y", &f);
+	text(F_md, 16, 58 + (36 - fh(F_md)) / 2, s, th.text);
+	glyph(G_CHEVL, NCW - 84, 66, 20, th.text);
+	glyph(G_CHEVR, NCW - 44, 66, 20, th.text);
+	for (c = 0; c < 7; c++) textc(F_sm, 12 + c * cw, 100 + (28 - fh(F_sm)) / 2, cw, RO ? wro[c] : wen[c], th.sub);
+	off = (f.tm_wday - first + 7) % 7;
+	for (r = 0; r < 6; r++)
+		for (c = 0; c < 7; c++) {
+			int d = r * 7 + c - off + 1, x = 12 + c * cw, y = 128 + r * 40, in = d >= 1 && d <= nd;
+			unsigned col = in ? th.text : th.sub;
+			if (in && cal_year == now.tm_year && cal_mon == now.tm_mon && d == now.tm_mday) {
+				rrect(x + (cw - 36) / 2, y + 2, 36, 36, 18, th.accent, 255);
+				col = th.onaccent;
+			}
+			snprintf(s, sizeof s, "%d", d < 1 ? pd + d : d > nd ? d - nd : d);
+			textc(F_sm, x, y + (40 - fh(F_sm)) / 2, cw, s, col);
+		}
+	blit(calwin, NCW, CALH);
+}
+
+static void nc_draw(void)
+{
+	const char *ca = T("Clear all", "Șterge tot");
+	buf_ensure(NCW, nc_h);
+	fill(0, 0, NCW, nc_h, th.border);
+	fill(1, 1, NCW - 2, nc_h - 2, th.menu);
+	text(F_ui, 16, (48 - fh(F_ui)) / 2, T("Notifications", "Notificări"), th.text);
+	if (nnf) text(F_sm, NCW - 16 - tw(F_sm, ca), (48 - fh(F_sm)) / 2, ca, nc_hover == -2 ? th.accent : th.sub);
+	if (!nc_nrows) textc(F_sm, 0, 48 + (48 - fh(F_sm)) / 2, NCW, T("No new notifications", "Nicio notificare nouă"), th.sub);
+	for (int k = 0; k < nc_nrows; k++) {
+		int y = 48 + k * NCI;
+		rbox(8, y, NCW - 16, NCI - 6, 6, nc_hover == k ? th.hover : th.card, th.border);
+		nf_card(&nf[nc_rows[k]], 8, y - 2, NCW - 16);
+	}
+	blit(ncwin, NCW, nc_h);
+	cal_draw();
+}
+
+static void nc_open(int m)
+{
+	time_t t = time(NULL);
+	struct tm *tm = localtime(&t);
+	close_popups();
+	cal_year = tm->tm_year;
+	cal_mon = tm->tm_mon;
+	nc_m = m;
+	if (!ncwin) {
+		ncwin = popup_win();
+		calwin = popup_win();
+		XResizeWindow(dpy, calwin, NCW, CALH);
+		shape_round(calwin, NCW, CALH, 8);
+	}
+	nc_on = 1;
+	nc_hover = -1;
+	for (int i = 0; i < nnf; i++) nf[i].until = 0;
+	toasts_draw();
+	nc_layout();
+	XMoveWindow(dpy, calwin, nc_x(), cal_top());
+	XMapRaised(dpy, calwin);
+	XMapRaised(dpy, ncwin);
+	nc_draw();
+	grab_input();
+	tb_draw_all();
+}
+
+static void nc_close(void)
+{
+	if (!nc_on) return;
+	nc_on = 0;
+	XUnmapWindow(dpy, ncwin);
+	XUnmapWindow(dpy, calwin);
+	ungrab_input();
+	tb_draw_all();
+}
+
+static int nc_hit(int x, int y)
+{
+	int k;
+	if (y < 48) return nnf && x >= NCW - 100 ? -2 : -1;
+	k = (y - 48) / NCI;
+	if (k >= nc_nrows) return -1;
+	return x >= NCW - 48 && y - 48 - k * NCI < 34 ? 100 + k : k;
+}
+
+static void nc_press(Window w, int x, int y)
+{
+	int h;
+	if (w == calwin) {
+		if (y < 48) { time_t t = time(NULL); struct tm *tm = localtime(&t); cal_year = tm->tm_year; cal_mon = tm->tm_mon; }
+		else if (y >= 58 && y < 94 && x >= NCW - 92 && x < NCW - 16) {
+			cal_mon += x < NCW - 54 ? -1 : 1;
+			if (cal_mon < 0) { cal_mon = 11; cal_year--; }
+			if (cal_mon > 11) { cal_mon = 0; cal_year++; }
+		} else return;
+		cal_draw();
+		return;
+	}
+	if ((h = nc_hit(x, y)) == -2) { while (nnf) nf_remove(nnf - 1, 2); nf_changed(); }
+	else if (h >= 100) { nf_remove(nc_rows[h - 100], 2); nf_changed(); }
+	else if (h >= 0) {
+		int i = nc_rows[h];
+		if (nf[i].act) nf_action(nf[i].id);
+		nf_remove(i, 2);
+		nc_close();
+		nf_changed();
+	}
+}
+
+/* --- Win+P: project to a second screen --- */
+
+enum { PJW = 360, PJI = 56, PJH = 48 + 4 * PJI + 12 };
+static char rr_p[32], rr_e[4][32];
+static RROutput rr_pid, rr_eid[4], rr_asked[16];
+static int rr_ne, rr_pw, rr_ph, rr_nasked;
+
+static int rr_name_ok(const char *n)
+{
+	return n[0] && strlen(n) < 32 && strspn(n, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.") == strlen(n);
+}
+
+static int rr_internal(const char *n) { return !strncmp(n, "eDP", 3) || !strncmp(n, "LVDS", 4) || !strncmp(n, "DSI", 3); }
+
+/* picks the laptop panel (or primary) and the other screens; returns the current mode 0..3 */
+static int rr_scan(void)
+{
+	XRRScreenResources *r = XRRGetScreenResourcesCurrent(dpy, root);
+	XRROutputInfo *oi[16] = {0};
+	RROutput prim = XRRGetOutputPrimary(dpy, root);
+	int no, i, pi = -1, pon = 0, eon = 0, same = 1, px = 0, py = 0, pass;
+	rr_p[0] = 0; rr_ne = 0; rr_pw = rr_ph = 0;
+	if (!r) return 0;
+	no = MIN(r->noutput, 16);
+	for (i = 0; i < no; i++) {
+		oi[i] = XRRGetOutputInfo(dpy, r, r->outputs[i]);
+		if (oi[i] && (oi[i]->connection != RR_Connected || !rr_name_ok(oi[i]->name))) { XRRFreeOutputInfo(oi[i]); oi[i] = NULL; }
+	}
+	for (pass = 0; pass < 3 && pi < 0; pass++)
+		for (i = 0; i < no && pi < 0; i++)
+			if (oi[i] && (pass == 2 || (pass == 0 ? rr_internal(oi[i]->name) : r->outputs[i] == prim))) pi = i;
+	if (pi >= 0) {
+		snprintf(rr_p, sizeof rr_p, "%s", oi[pi]->name);
+		rr_pid = r->outputs[pi];
+		if ((pon = oi[pi]->crtc != 0)) {
+			XRRCrtcInfo *ci = XRRGetCrtcInfo(dpy, r, oi[pi]->crtc);
+			if (ci) { px = ci->x; py = ci->y; XRRFreeCrtcInfo(ci); }
+		}
+		for (int k = 0; oi[pi]->npreferred && k < r->nmode; k++)
+			if (r->modes[k].id == oi[pi]->modes[0]) { rr_pw = (int)r->modes[k].width; rr_ph = (int)r->modes[k].height; }
+	}
+	for (i = 0; i < no; i++) {
+		if (!oi[i] || i == pi) continue;
+		if (rr_ne < 4) { rr_eid[rr_ne] = r->outputs[i]; snprintf(rr_e[rr_ne++], 32, "%s", oi[i]->name); }
+		if (oi[i]->crtc) {
+			XRRCrtcInfo *ci = XRRGetCrtcInfo(dpy, r, oi[i]->crtc);
+			eon = 1;
+			if (ci) { if (ci->x != px || ci->y != py) same = 0; XRRFreeCrtcInfo(ci); }
+		}
+	}
+	for (i = 0; i < no; i++) if (oi[i]) XRRFreeOutputInfo(oi[i]);
+	XRRFreeScreenResources(r);
+	return !eon ? 0 : !pon ? 3 : same ? 1 : 2;
+}
+
+static void rr_ask_add(RROutput o)
+{
+	for (int i = 0; i < rr_nasked; i++) if (rr_asked[i] == o) return;
+	if (rr_nasked < (int)LEN(rr_asked)) rr_asked[rr_nasked++] = o;
+}
+
+static void pj_apply(int mode)
+{
+	char cmd[700];
+	size_t l;
+	const char *prev;
+	rr_scan();
+	if (!rr_p[0]) return;
+	rr_ask_add(rr_pid);
+	if (mode == 3 && !rr_ne) mode = 0;
+	l = (size_t)snprintf(cmd, sizeof cmd, "xrandr --output %s %s", rr_p, mode == 3 ? "--off" : "--auto --primary --pos 0x0 --transform none");
+	prev = rr_p;
+	for (int i = 0; i < rr_ne && l < sizeof cmd; i++) {
+		rr_ask_add(rr_eid[i]);
+		if (mode == 0) l += (size_t)snprintf(cmd + l, sizeof cmd - l, " --output %s --off", rr_e[i]);
+		else if (mode == 1 && rr_pw) l += (size_t)snprintf(cmd + l, sizeof cmd - l, " --output %s --auto --same-as %s --scale-from %dx%d", rr_e[i], rr_p, rr_pw, rr_ph);
+		else if (mode == 1) l += (size_t)snprintf(cmd + l, sizeof cmd - l, " --output %s --auto --same-as %s", rr_e[i], rr_p);
+		else if (mode == 3 && !i) l += (size_t)snprintf(cmd + l, sizeof cmd - l, " --output %s --auto --primary --pos 0x0 --transform none", rr_e[i]);
+		else l += (size_t)snprintf(cmd + l, sizeof cmd - l, " --output %s --auto --transform none --right-of %s", rr_e[i], prev);
+		if (mode >= 2) prev = rr_e[i];
+	}
+	if (l < sizeof cmd) spawn(cmd);
+}
+
+static void mini_screen(int x, int y, int on)
+{
+	rbox(x, y, 22, 15, 2, on ? th.accent : th.card, on ? th.accent : th.sub);
+	fill(x + 8, y + 16, 6, 2, th.sub);
+}
+
+static void pj_draw(void)
+{
+	const char *lb[4] = {T("PC screen only", "Doar ecranul PC-ului"), T("Duplicate", "Duplicat"),
+		T("Extend", "Extindere"), T("Second screen only", "Doar al doilea ecran")};
+	buf_ensure(PJW, PJH);
+	fill(0, 0, PJW, PJH, th.border);
+	fill(1, 1, PJW - 2, PJH - 2, th.menu);
+	text(F_md, 16, (48 - fh(F_md)) / 2, T("Project", "Proiectare"), th.text);
+	for (int i = 0; i < 4; i++) {
+		int y = 48 + i * PJI, ix = 24, iy = y + 16;
+		if (i == pj_sel) rbox(12, y + 2, PJW - 24, PJI - 4, 6, th.hover, th.accent);
+		else rbox(12, y + 2, PJW - 24, PJI - 4, 6, th.card, th.border);
+		if (i == 1) { mini_screen(ix, iy - 3, 1); mini_screen(ix + 8, iy + 3, 1); }
+		else { mini_screen(ix, iy, i != 3); mini_screen(ix + 26, iy, i != 0); }
+		text(F_ui, 88, y + (PJI - fh(F_ui)) / 2, lb[i], th.text);
+		if (i == pj_cur) glyph(G_CHECK, PJW - 44, y + 18, 20, th.accent);
+	}
+	blit(pjwin, PJW, PJH);
+}
+
+static void pj_open(void)
+{
+	close_popups();
+	pj_cur = rr_scan();
+	pj_sel = pj_due < 0 ? 2 : pj_cur;
+	if (!pjwin) {
+		pjwin = popup_win();
+		XResizeWindow(dpy, pjwin, PJW, PJH);
+		shape_round(pjwin, PJW, PJH, 8);
+	}
+	XMoveWindow(dpy, pjwin, mons[0].x + mons[0].w - PJW - 12, pop_y(0, PJH));
+	pj_on = 1;
+	XMapRaised(dpy, pjwin);
+	pj_draw();
+	grab_input();
+}
+
+static void pj_close(void)
+{
+	if (!pj_on) return;
+	pj_on = 0;
+	XUnmapWindow(dpy, pjwin);
+	ungrab_input();
+}
+
+static void pj_key(KeySym ks)
+{
+	if (ks == XK_Escape) pj_close();
+	else if (ks == XK_Return || ks == XK_KP_Enter || ks == XK_space) { pj_close(); pj_apply(pj_sel); }
+	else if (ks == XK_Down || ks == XK_Tab || ks == XK_p) { pj_sel = (pj_sel + 1) % 4; pj_draw(); }
+	else if (ks == XK_Up) { pj_sel = (pj_sel + 3) % 4; pj_draw(); }
+}
+
+/* after a hotplug: turn off unplugged screens, ask once about a new one */
+static void rr_reconcile(void)
+{
+	XRRScreenResources *r = XRRGetScreenResourcesCurrent(dpy, root);
+	char cmd[400] = "xrandr", first[32] = "";
+	RROutput keep[16];
+	int nk = 0, off = 0, active = 0, ask = 0;
+	size_t l = 6;
+	if (!r) return;
+	for (int i = 0; i < r->noutput; i++) {
+		XRROutputInfo *o = XRRGetOutputInfo(dpy, r, r->outputs[i]);
+		int k;
+		if (!o) continue;
+		if (o->connection == RR_Connected) {
+			if (!first[0] && rr_name_ok(o->name)) snprintf(first, sizeof first, "%s", o->name);
+			if (o->crtc) active = 1;
+			for (k = 0; k < rr_nasked && rr_asked[k] != r->outputs[i]; k++);
+			if (k < rr_nasked) { if (nk < 16) keep[nk++] = r->outputs[i]; }
+			else if (!o->crtc && nk < 16) { keep[nk++] = r->outputs[i]; ask = 1; }
+		} else if (o->crtc && rr_name_ok(o->name) && l < sizeof cmd) {
+			l += (size_t)snprintf(cmd + l, sizeof cmd - l, " --output %s --off", o->name);
+			off = 1;
+		}
+		XRRFreeOutputInfo(o);
+	}
+	XRRFreeScreenResources(r);
+	memcpy(rr_asked, keep, sizeof *keep * (size_t)nk);
+	rr_nasked = nk;
+	if (off && !active && first[0] && l < sizeof cmd) snprintf(cmd + l, sizeof cmd - l, " --output %s --auto --primary", first);
+	if (off && l < sizeof cmd) spawn(cmd);
+	if (ask && !pj_on) { pj_due = -1; pj_open(); pj_due = 0; }
+}
+
+/* --- timers --- */
+
+static long long next_deadline(void)
+{
+	long long d = osd_until;
+	for (int i = 0; i < nnf; i++) if (nf[i].until && (!d || nf[i].until < d)) d = nf[i].until;
+	if (pj_due > 0 && (!d || pj_due < d)) d = pj_due;
+	return d;
+}
+
+static void timers(void)
+{
+	long long t = now_ms();
+	int ch = 0;
+	if (osd_until && t >= osd_until) { osd_until = 0; XUnmapWindow(dpy, osdwin); }
+	for (int i = 0; i < nnf; i++) if (nf[i].until && t >= nf[i].until) { nf[i].until = 0; nf_closed(nf[i].id, 1); ch = 1; }
+	if (ch) nf_changed();
+	if (pj_due > 0 && t >= pj_due) { pj_due = 0; rr_reconcile(); }
+}
+
+/* --- keyboard focus and moves by direction --- */
+
+static void warp_to(Client *c)
+{
+	if (c && !c->minimized && c->ws == curws) XWarpPointer(dpy, None, root, 0, 0, 0, 0, c->x + c->w / 2, c->y + c->h / 2);
+}
+
+static Client *dir_client(Client *from, int fx, int fy, int dx, int dy, int tiled)
+{
+	Client *best = NULL;
+	long bs = 0;
+	for (Client *c = clients; c; c = c->next) {
+		if (c == from || c->ws != curws || c->minimized || c->skiptb || (tiled && !is_tiled(c))) continue;
+		int cx = c->x + c->w / 2 - fx, cy = c->y + c->h / 2 - fy, along = cx * dx + cy * dy;
+		long s = along + 2L * abs(cx * dy + cy * dx);
+		/* only windows that share a row (left/right) or a column (up/down) with the source */
+		int lo = dx ? (from ? from->y : fy) : (from ? from->x : fx), hi = lo + (from ? (dx ? from->h : from->w) : 1);
+		if (dx ? c->y >= hi || c->y + c->h <= lo : c->x >= hi || c->x + c->w <= lo) continue;
+		if (along > 0 && (!best || s < bs)) { best = c; bs = s; }
+	}
+	return best;
+}
+
+static int mon_dir(int m, int dx, int dy)
+{
+	int best = -1;
+	long bs = 0;
+	for (int i = 0; i < nmons; i++) {
+		int cx = mons[i].x + mons[i].w / 2 - mons[m].x - mons[m].w / 2, cy = mons[i].y + mons[i].h / 2 - mons[m].y - mons[m].h / 2;
+		int along = cx * dx + cy * dy;
+		long s = along + 2L * abs(cx * dy + cy * dx);
+		if (i != m && along > 0 && (best < 0 || s < bs)) { best = i; bs = s; }
+	}
+	return best;
+}
+
+static void to_mon(Client *c, int t)
+{
+	int m = mon_of(c), dx, dy, x, y, w, h;
+	if (t < 0 || t == m) return;
+	dx = mons[t].x - mons[m].x; dy = mons[t].y - mons[m].y;
+	c->ox += dx; c->oy += dy; c->gx += dx; c->gy += dy; c->fx += dx; c->fy += dy;
+	workarea(t, &x, &y, &w, &h);
+	if (c->full) { c->x = mons[t].x; c->y = mons[t].y; c->w = mons[t].w; c->h = mons[t].h; }
+	else if (c->max) { c->x = x; c->y = y; c->w = w; c->h = h; }
+	else if (c->snap) { c->x = c->snap == 1 ? x : x + w / 2; c->y = y; c->w = c->snap == 1 ? w / 2 : w - w / 2; c->h = h; }
+	else {
+		c->w = MIN(c->w, w); c->h = MIN(c->h, h);
+		c->x = CLAMP(c->x + dx, x, x + w - c->w); c->y = CLAMP(c->y + dy, y, y + h - c->h);
+	}
+	apply(c);
+	arrange();
+}
+
+static void focus_dir(int dx, int dy)
+{
+	int fx, fy, d;
+	unsigned u;
+	Window r, ch;
+	Client *n;
+	Client *f = sel && !sel->minimized && sel->ws == curws ? sel : NULL;
+	if (f) { fx = f->x + f->w / 2; fy = f->y + f->h / 2; }
+	else XQueryPointer(dpy, root, &r, &ch, &fx, &fy, &d, &d, &u);
+	if ((n = dir_client(f, fx, fy, dx, dy, 0))) { activate(n); warp_to(n); }
+}
+
+static void move_dir(Client *c, int dx, int dy)
+{
+	int t, side = dx < 0 ? 1 : 2;
+	if (is_tiled(c)) {
+		Client *n = dir_client(c, c->x + c->w / 2, c->y + c->h / 2, dx, dy, 1);
+		if (n) tile_swap(c, n);
+		else if ((t = mon_dir(mon_of(c), dx, dy)) >= 0) { c->tord = ++tordctr; to_mon(c, t); }
+	} else if (dy < 0) { if (c->snap) set_max(c, 0); set_max(c, 1); }
+	else if (dy > 0) { if (c->max || c->snap) set_max(c, 0); else { minimize(c); return; } }
+	else if (c->snap == 3 - side) set_max(c, 0);
+	else if (c->snap == side) { if ((t = mon_dir(mon_of(c), dx, 0)) >= 0) { c->snap = 3 - side; to_mon(c, t); } }
+	else set_snap(c, side);
+	warp_to(c);
+}
+
 static void close_popups(void)
 {
+	nc_close();
+	pj_close();
 	tv_close();
 	ctx_close();
 	sm_close();
@@ -2094,44 +2891,48 @@ static void ws_move(Client *c, int n)
 static void super_key(KeySym ks, unsigned st)
 {
 	Client *c = sel;
+	int sh = st & ShiftMask, dx = ks == XK_Left ? -1 : ks == XK_Right ? 1 : 0, dy = ks == XK_Up ? -1 : ks == XK_Down ? 1 : 0;
 	if (ks >= XK_1 && ks <= XK_9) {
-		if (st & ShiftMask) { if (c) ws_move(c, (int)(ks - XK_1)); }
-		else ws_view((int)(ks - XK_1));
+		int n = (int)(ks - XK_1);
+		if (sh && c) { ws_move(c, n); ws_view(n); activate(c); }
+		else ws_view(n);
+		warp_to(sel);
 		return;
 	}
-	if ((st & ControlMask) && (ks == XK_Left || ks == XK_Right)) { ws_view(curws + (ks == XK_Left ? -1 : 1)); return; }
-	if (c && is_tiled(c) && (ks == XK_Left || ks == XK_Right)) { tile_swap(c, ks == XK_Left ? -1 : 1); return; }
+	if ((st & ControlMask) && dx) { ws_view(curws + dx); warp_to(sel); return; }
+	if (dx || dy) {
+		if (sh) { if (c && c->ws == curws && !c->minimized && !c->full) move_dir(c, dx, dy); }
+		else focus_dir(dx, dy);
+		return;
+	}
+	if (pj_on && ks == XK_p) { pj_key(ks); return; }
 	switch (ks) {
 	case XK_Tab: if (tv_on) tv_close(); else tv_open(pointer_mon()); break;
-	case XK_space: if (nkbl > 1) XkbLockGroup(dpy, XkbUseCoreKbd, (unsigned)((kbd_group() + (st & ShiftMask ? nkbl - 1 : 1)) % nkbl)); break;
+	case XK_space: if (nkbl > 1) XkbLockGroup(dpy, XkbUseCoreKbd, (unsigned)((kbd_group() + (sh ? nkbl - 1 : 1)) % nkbl)); break;
 	case XK_t: { int on = !tilews[curws]; for (int i = 0; i < NWS; i++) tilews[i] = on; arrange(); tb_draw_all(); break; }
 	case XK_f:
 		if (!c) break;
-		c->floating = !c->floating;
-		arrange();
-		if (c->floating) raise_client(c);
+		if (sh) {
+			c->floating = !c->floating;
+			arrange();
+			if (c->floating) raise_client(c);
+		} else set_full(c, !c->full);
 		break;
+	case XK_q: if (c) close_client(c); break;
+	case XK_p: pj_open(); break;
+	case XK_n: if (nc_on) nc_close(); else nc_open(pointer_mon()); break;
 	case XK_d: close_popups(); show_desktop(); break;
 	case XK_m: close_popups(); for (Client *k = clients; k; k = k->next) if (!k->skiptb && k->ws == curws) minimize(k); break;
 	case XK_e: close_popups(); spawn(cfg.files); break;
 	case XK_r: sm_open(3, pointer_mon()); break;
 	case XK_s:
-		if (st & ShiftMask) { close_popups(); screenshot(1); }
+		if (sh) { close_popups(); screenshot(1); }
 		else sm_open(3, pointer_mon());
 		break;
-	case XK_q: sm_open(3, pointer_mon()); break;
 	case XK_l: close_popups(); lock_screen(); break;
 	case XK_i: close_popups(); spawn("gluewin-settings"); break;
 	case XK_a: if (qs_on) qs_close(); else qs_open(); break;
 	case XK_Return: close_popups(); spawn(cfg.terminal); break;
-	case XK_Up: if (c) { if (c->snap) set_max(c, 0); set_max(c, 1); } break;
-	case XK_Down:
-		if (!c) break;
-		if (c->max || c->snap) set_max(c, 0);
-		else minimize(c);
-		break;
-	case XK_Left: if (c) { if (c->snap == 2) set_max(c, 0); else set_snap(c, 1); } break;
-	case XK_Right: if (c) { if (c->snap == 1) set_max(c, 0); else set_snap(c, 2); } break;
 	}
 }
 
@@ -2150,9 +2951,10 @@ static void keypress(XKeyEvent *e)
 	if (ks == XK_Super_L || ks == XK_Super_R) { super_alone = 1; return; }
 	super_alone = 0;
 	if (st & Mod4Mask) { super_key(ks, st); return; }
+	if (pj_on) { pj_key(ks); return; }
 	if (sm_on && !ctx_on) { sm_key(e); return; }
-	if (ctx_on || qs_on || tv_on) {
-		if (ks == XK_Escape) { if (ctx_on) ctx_close(); else if (tv_on) tv_close(); else qs_close(); }
+	if (ctx_on || qs_on || tv_on || nc_on) {
+		if (ks == XK_Escape) { if (ctx_on) ctx_close(); else if (tv_on) tv_close(); else if (nc_on) nc_close(); else qs_close(); }
 		return;
 	}
 	if ((st & Mod1Mask) && ks == XK_Tab) { at_start(st & ShiftMask); return; }
@@ -2172,11 +2974,8 @@ static void keypress(XKeyEvent *e)
 	}
 	switch (ks) {
 	case XK_Print: screenshot(0); break;
-	case XF86XK_AudioRaiseVolume: spawn(have("wpctl") ? "wpctl set-volume -l 1 @DEFAULT_AUDIO_SINK@ 5%+" : "pactl set-sink-volume @DEFAULT_SINK@ +5%"); break;
-	case XF86XK_AudioLowerVolume: spawn(have("wpctl") ? "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-" : "pactl set-sink-volume @DEFAULT_SINK@ -5%"); break;
-	case XF86XK_AudioMute: spawn(have("wpctl") ? "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle" : "pactl set-sink-mute @DEFAULT_SINK@ toggle"); break;
-	case XF86XK_MonBrightnessUp: spawn("brightnessctl -q set 5%+"); break;
-	case XF86XK_MonBrightnessDown: spawn("brightnessctl -q set 5%-"); break;
+	case XF86XK_AudioRaiseVolume: case XF86XK_AudioLowerVolume: case XF86XK_AudioMute:
+	case XF86XK_MonBrightnessUp: case XF86XK_MonBrightnessDown: media_key(ks); break;
 	case XF86XK_AudioPlay: spawn("playerctl play-pause"); break;
 	case XF86XK_AudioNext: spawn("playerctl next"); break;
 	case XF86XK_AudioPrev: spawn("playerctl previous"); break;
@@ -2197,15 +2996,9 @@ static void keyrelease(XKeyEvent *e)
 
 /* ---------- drag ---------- */
 
-static void snap_preview(int zone, int m)
+static void outline(int x, int y, int w, int h)
 {
-	int x, y, w, h;
 	XRectangle r[4];
-	if (!zone) { if (snapwin) XUnmapWindow(dpy, snapwin); return; }
-	workarea(m, &x, &y, &w, &h);
-	if (zone == 1) w /= 2;
-	else if (zone == 2) { x += w / 2; w -= w / 2; }
-	x += 6; y += 6; w -= 12; h -= 12;
 	if (!snapwin) {
 		XSetWindowAttributes swa;
 		swa.override_redirect = True;
@@ -2223,6 +3016,16 @@ static void snap_preview(int zone, int m)
 	XClearWindow(dpy, snapwin);
 }
 
+static void snap_preview(int zone, int m)
+{
+	int x, y, w, h;
+	if (!zone) { if (snapwin) XUnmapWindow(dpy, snapwin); return; }
+	workarea(m, &x, &y, &w, &h);
+	if (zone == 1) w /= 2;
+	else if (zone == 2) { x += w / 2; w -= w / 2; }
+	outline(x + 6, y + 6, w - 12, h - 12);
+}
+
 static int dir_cursor(int d)
 {
 	switch (d) {
@@ -2238,7 +3041,8 @@ static void drag_start(Client *c, int mode, int dir, int px, int py)
 	close_popups();
 	if (XGrabPointer(dpy, root, False, ButtonPressMask | ButtonReleaseMask | PointerMotionMask, GrabModeAsync, GrabModeAsync,
 		None, cur[mode ? dir_cursor(dir) : CUR_NORMAL], CurrentTime) != GrabSuccess) return;
-	drag = (typeof(drag)){1, mode, dir, px, py, c->x, c->y, c->w, c->h, 0, 0, c};
+	drag = (typeof(drag)){1, mode, dir, px, py, c->x, c->y, c->w, c->h, 0, 0, is_tiled(c), c};
+	drag_tgt = NULL;
 }
 
 static void drag_motion(int px, int py)
@@ -2247,7 +3051,27 @@ static void drag_motion(int px, int py)
 	int dx = px - drag.px, dy = py - drag.py, m;
 	if (!c) return;
 	if (!drag.moved && abs(dx) < 4 && abs(dy) < 4) return;
-	if (!drag.moved && is_tiled(c)) { c->floating = 1; c->tiled = 0; arrange(); }
+	if (drag.tiled) {
+		/* tiled windows stay tiled: moving picks a slot to swap, resizing moves the split */
+		drag.moved = 1;
+		if (drag.mode == 0) {
+			Client *t = NULL;
+			c->x = drag.ox + dx; c->y = drag.oy + dy;
+			move_only(c);
+			for (Client *k = clients; k; k = k->next)
+				if (k != c && is_tiled(k) && k->ws == curws && px >= k->x && px < k->x + k->w && py >= k->y && py < k->y + k->h) t = k;
+			if (t != drag_tgt) {
+				if ((drag_tgt = t)) outline(t->x + 4, t->y + 4, t->w - 8, t->h - 8);
+				else if (snapwin) XUnmapWindow(dpy, snapwin);
+			}
+		} else if (drag.dir & (DL | DR)) {
+			int x, y, w, h;
+			workarea(mon_of(c), &x, &y, &w, &h);
+			mfact = CLAMP((float)(px - x - GAP) / (float)MAX(w - 2 * GAP, 1), .2f, .8f);
+			arrange();
+		}
+		return;
+	}
 	if (drag.mode == 0) {
 		if (!drag.moved && (c->max || c->snap)) {
 			/* tearing a maximized window off keeps the cursor at the same spot of the title */
@@ -2289,6 +3113,13 @@ static void drag_end(int px, int py)
 	XUngrabPointer(dpy, CurrentTime);
 	if (snapwin) XUnmapWindow(dpy, snapwin);
 	if (!c) return;
+	if (drag.tiled) {
+		Client *t = drag_tgt;
+		drag_tgt = NULL;
+		if (t) tile_swap(c, t);
+		else arrange();
+		return;
+	}
 	if (drag.mode == 0 && zone) {
 		int m = mon_at(px, py);
 		c->x = CLAMP(c->x, mons[m].x, mons[m].x + mons[m].w - 40);
@@ -2303,7 +3134,8 @@ static void drag_end(int px, int py)
 
 static int in_popup(Window w)
 {
-	return (sm_on && w == smwin) || (ctx_on && w == ctxwin) || (qs_on && w == qswin) || (at_on && w == atwin) || (tv_on && w == tvwin);
+	return (sm_on && w == smwin) || (ctx_on && w == ctxwin) || (qs_on && w == qswin) || (at_on && w == atwin) || (tv_on && w == tvwin) ||
+		(nc_on && (w == ncwin || w == calwin)) || (pj_on && w == pjwin);
 }
 
 static void tb_ctx(int x, int m)
@@ -2331,6 +3163,7 @@ static void tb_press(int m, XButtonEvent *e)
 	case TB_START: if (sm_on) sm_close(); else sm_open(0, m); break;
 	case TB_SEARCH: sm_open(3, m); break;
 	case TB_SYS: if (qs_on) qs_close(); else qs_open(); break;
+	case TB_CLOCK: if (nc_on) nc_close(); else nc_open(m); break;
 	case TB_DESK: close_popups(); show_desktop(); break;
 	case TB_LANG: {
 		int g = kbd_group();
@@ -2456,13 +3289,14 @@ static void buttonpress(XButtonEvent *e)
 	Client *c;
 	int m, side;
 	if (drag.on) return;
-	if ((sm_on || ctx_on || qs_on || tv_on) && !in_popup(e->window)) {
-		int was_start = sm_on, was_qs = qs_on, was_tv = tv_on;
+	if ((sm_on || ctx_on || qs_on || tv_on || nc_on || pj_on) && !in_popup(e->window)) {
+		int was_start = sm_on, was_qs = qs_on, was_tv = tv_on, was_nc = nc_on;
 		if (ctx_on && !(sm_on && e->window == smwin)) { ctx_close(); if (sm_on && e->window == smwin) goto popup; }
 		m = monbar(e->window);
 		if (m >= 0) {
 			int i = tb_hit(m, e->x);
-			if (i >= 0 && ((tbi[i].kind == TB_START && was_start) || (tbi[i].kind == TB_SYS && was_qs) || (tbi[i].kind == TB_TASKVIEW && was_tv))) { close_popups(); return; }
+			if (i >= 0 && ((tbi[i].kind == TB_START && was_start) || (tbi[i].kind == TB_SYS && was_qs) || (tbi[i].kind == TB_TASKVIEW && was_tv) ||
+				(tbi[i].kind == TB_CLOCK && was_nc))) { close_popups(); return; }
 		}
 		close_popups();
 		if (m < 0 && e->window == root) return;
@@ -2487,7 +3321,14 @@ popup:
 	}
 	if (ctx_on && e->window == ctxwin) { int i = ctx_hit(e->y); if (i >= 0 && e->button == 1) ctx_activate(i); return; }
 	if (qs_on && e->window == qswin) { if (e->button == 1) qs_press(e->x, e->y); return; }
-	if (tv_on && e->window == tvwin) { int i = tv_hit(e->x, e->y); if (i >= 0 && e->button == 1) tv_pick(i); return; }
+	if (tv_on && e->window == tvwin) { if (e->button == 1) tv_press(e->x, e->y); return; }
+	if (nc_on && (e->window == ncwin || e->window == calwin)) { if (e->button == 1) nc_press(e->window, e->x, e->y); return; }
+	if (pj_on && e->window == pjwin) {
+		int i = (e->y - 48) / PJI;
+		if (e->button == 1 && e->y >= 48 && i < 4) { pj_close(); pj_apply(i); }
+		return;
+	}
+	for (int k = 0; k < 3; k++) if (toast_id[k] && e->window == toastwin[k]) { toast_press(k, e); return; }
 	if ((c = bywin(e->window))) {
 		activate(c);
 		XAllowEvents(dpy, ReplayPointer, CurrentTime);
@@ -2514,6 +3355,20 @@ static void motion(XMotionEvent *e)
 	XEvent ev;
 	while (XCheckTypedEvent(dpy, MotionNotify, &ev)) e = &ev.xmotion;
 	if (drag.on) { drag_motion(e->x_root, e->y_root); return; }
+	if (tv_on && tv_dc) {
+		if (!tv_moved && abs(e->x_root - tv_x - tv_px) < 5 && abs(e->y_root - tv_y - tv_py) < 5) return;
+		tv_moved = 1;
+		tv_mx = e->x_root - tv_x; tv_my = e->y_root - tv_y;
+		tv_hover = tv_hit(tv_mx, tv_my);
+		tv_draw();
+		return;
+	}
+	if (nc_on && e->window == ncwin) {
+		int h = nc_hit(e->x, e->y);
+		if (h >= 100) h -= 100;
+		if (h != nc_hover) { nc_hover = h; nc_draw(); }
+		return;
+	}
 	if (qs_on && qs_drag) {
 		int v = CLAMP((e->x_root - (int)(mons[0].x + mons[0].w - QSW - 12) - 52) * 100 / (QSW - 52 - 56), 0, 100);
 		qs_apply(qs_drag, v, 0);
@@ -2567,6 +3422,7 @@ static void buttonrelease(XButtonEvent *e)
 {
 	Client *c;
 	if (drag.on) { drag_end(e->x_root, e->y_root); return; }
+	if (tv_on && tv_dc) { tv_release(e->x_root, e->y_root); return; }
 	if (qs_drag) {
 		int v = CLAMP((e->x_root - (int)(mons[0].x + mons[0].w - QSW - 12) - 52) * 100 / (QSW - 52 - 56), 0, 100);
 		qs_apply(qs_drag, v, 1);
@@ -2585,7 +3441,8 @@ static void leave(XCrossingEvent *e)
 	else if (sm_on && e->window == smwin && sm_hover >= 0) { sm_hover = -1; sm_draw(); }
 	else if (ctx_on && e->window == ctxwin && ctx_hover >= 0) { ctx_hover = -1; ctx_draw(); }
 	else if (qs_on && e->window == qswin && qs_hover >= 0) { qs_hover = -1; qs_draw(); }
-	else if (tv_on && e->window == tvwin && tv_hover >= 0) { tv_hover = -1; tv_draw(); }
+	else if (tv_on && e->window == tvwin && tv_hover >= 0 && !tv_dc) { tv_hover = -1; tv_draw(); }
+	else if (nc_on && e->window == ncwin && nc_hover != -1) { nc_hover = -1; nc_draw(); }
 }
 
 static void clientmessage(XClientMessageEvent *e)
@@ -2661,6 +3518,10 @@ static void expose(XExposeEvent *e)
 	else if (qs_on && e->window == qswin) qs_draw();
 	else if (at_on && e->window == atwin) at_draw();
 	else if (tv_on && e->window == tvwin) tv_draw();
+	else if (nc_on && (e->window == ncwin || e->window == calwin)) nc_draw();
+	else if (pj_on && e->window == pjwin) pj_draw();
+	else if (osd_until && e->window == osdwin) osd_draw();
+	else for (int k = 0; k < 3; k++) if (toast_id[k] && e->window == toastwin[k]) toast_paint(k);
 }
 
 static void reload(void)
@@ -2673,8 +3534,8 @@ static void reload(void)
 		c->shr = -1;
 		apply(c);
 	}
-	for (int i = 0; i < 5; i++) {
-		Window w[5] = {smwin, ctxwin, qswin, atwin, tvwin};
+	for (int i = 0; i < 11; i++) {
+		Window w[11] = {smwin, ctxwin, qswin, atwin, tvwin, ncwin, calwin, pjwin, osdwin, toastwin[0], toastwin[1]};
 		if (w[i]) XSetWindowBackground(dpy, w[i], th.menu);
 	}
 	if (cfg.tiling != last_tiling) {
@@ -2686,6 +3547,8 @@ static void reload(void)
 	kbd_apply();
 	if (sm_on) sm_draw();
 	if (qs_on) qs_draw();
+	if (nc_on) nc_draw();
+	toasts_draw();
 }
 
 static int rr_event;
@@ -2740,7 +3603,8 @@ static void handle(XEvent *ev)
 		XRRUpdateConfiguration(ev);
 		update_mons();
 		wallpaper();
-	}
+		if (nc_on || pj_on) close_popups();
+	} else if (ev->type == rr_event + RRNotify) pj_due = now_ms() + 700;
 }
 
 /* ---------- startup ---------- */
@@ -2833,7 +3697,7 @@ static void setup(void)
 	XChangeProperty(dpy, root, A[NetCurDesktop], XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&zero, 1);
 	XDeleteProperty(dpy, root, A[NetClientList]);
 
-	if (XRRQueryExtension(dpy, &rr_event, &rr_err)) XRRSelectInput(dpy, root, RRScreenChangeNotifyMask);
+	if (XRRQueryExtension(dpy, &rr_event, &rr_err)) XRRSelectInput(dpy, root, RRScreenChangeNotifyMask | RROutputChangeNotifyMask);
 	(void)swa;
 	int xop, xerr, xmaj = XkbMajorVersion, xmin = XkbMinorVersion;
 	if (XkbQueryExtension(dpy, &xop, &xkb_event, &xerr, &xmaj, &xmin))
@@ -2841,6 +3705,11 @@ static void setup(void)
 	kbd_refresh();
 	kbd_apply();
 	update_mons();
+	rr_scan();
+	rr_ask_add(rr_pid);
+	for (int i = 0; i < rr_ne; i++) rr_ask_add(rr_eid[i]);
+	bus_setup();
+	qs_probe();
 	tray_setup();
 	grab_keys();
 	wallpaper();
@@ -2886,7 +3755,7 @@ int main(int argc, char **argv)
 {
 	XEvent ev;
 	int fd;
-	if (argc > 1 && (!strcmp(argv[1], "-v") || !strcmp(argv[1], "--version"))) { puts("gluewin 0.1"); return 0; }
+	if (argc > 1 && (!strcmp(argv[1], "-v") || !strcmp(argv[1], "--version"))) { puts("gluewin 0.2"); return 0; }
 	if (argc > 1 && !strcmp(argv[1], "--reload")) {
 		if (!(dpy = XOpenDisplay(NULL))) return 1;
 		gfx_init();
@@ -2902,13 +3771,20 @@ int main(int argc, char **argv)
 		if (!running || quit_sig) break;
 		fd_set fds;
 		struct timeval tv;
-		time_t t = time(NULL);
-		int to = 60 - (int)(t % 60);
-		tv.tv_sec = MIN(to, 15);
-		tv.tv_usec = 0;
+		long long n = now_ms(), dl = next_deadline(), to = MIN((60 - time(NULL) % 60) * 1000LL, 15000LL);
+		int r, mx = fd;
+		if (dl) to = CLAMP(dl - n, 0, to);
+		tv.tv_sec = (time_t)(to / 1000);
+		tv.tv_usec = (suseconds_t)(to % 1000 * 1000);
 		FD_ZERO(&fds);
 		FD_SET(fd, &fds);
-		if (select(fd + 1, &fds, NULL, NULL, &tv) == 0) tb_draw_all();
+		if (qs_fd >= 0) { FD_SET(qs_fd, &fds); mx = MAX(mx, qs_fd); }
+		if (bus_fd >= 0) { FD_SET(bus_fd, &fds); mx = MAX(mx, bus_fd); }
+		r = select(mx + 1, &fds, NULL, NULL, &tv);
+		if (r > 0 && qs_fd >= 0 && FD_ISSET(qs_fd, &fds)) qs_probe_read();
+		if (r > 0 && bus_fd >= 0 && FD_ISSET(bus_fd, &fds)) bus_pump();
+		timers();
+		if (r == 0) tb_draw_all();
 		XFlush(dpy);
 	}
 	cleanup();

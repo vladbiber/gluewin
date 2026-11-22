@@ -610,7 +610,7 @@ static int pg_pers(int x, int y, int w)
 	y += RH + 20;
 	section(x, &y, T("Multitasking", "Multitasking"));
 	row(x, y, w, G_APPS, T("Tile windows automatically", "Aranjează ferestrele automat (tiling)"),
-		T("Win+T toggles, Win+F floats a window", "Win+T pornește/oprește, Win+F scoate o fereastră"));
+		T("Win+T toggles, Win+Shift+F floats a window", "Win+T pornește/oprește, Win+Shift+F scoate o fereastră"));
 	toggle(x + w, y, cfg.tiling, T_TILING);
 	y += RH + 20;
 	section(x, &y, T("Background", "Fundal"));

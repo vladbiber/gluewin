@@ -6,7 +6,7 @@ LDLIBS = $(shell pkg-config --libs xft xrender xext xrandr libpng) -lm
 all: gluewin gluewin-settings
 
 gluewin: gluewin.c common.h
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ gluewin.c $(LDLIBS)
+	$(CC) $(CFLAGS) $(shell pkg-config --cflags dbus-1) $(LDFLAGS) -o $@ gluewin.c $(LDLIBS) $(shell pkg-config --libs dbus-1)
 
 gluewin-settings: gluewin-settings.c common.h
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags libjpeg libwebp) $(LDFLAGS) -o $@ gluewin-settings.c $(LDLIBS) $(shell pkg-config --libs libjpeg libwebp)
